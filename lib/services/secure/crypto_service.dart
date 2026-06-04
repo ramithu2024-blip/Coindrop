@@ -69,10 +69,17 @@ class CryptoService {
   }
 
   /// Constant-time comparison of derived key against stored verification hash.
+  /// Uses a manual byte-by-byte XOR comparison to prevent timing side channels.
   bool verifyDerivedKey(Uint8List derivedKey, String storedHash) {
     final computed = sha256.convert(derivedKey);
     final computedB64 = base64Encode(computed.bytes);
-    return computedB64 == storedHash;
+    if (computedB64.length != storedHash.length) return false;
+
+    var result = 0;
+    for (var i = 0; i < computedB64.length; i++) {
+      result |= computedB64.codeUnitAt(i) ^ storedHash.codeUnitAt(i);
+    }
+    return result == 0;
   }
 
   /// Bundles salt and verification hash into one string for storage.

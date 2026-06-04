@@ -8,6 +8,8 @@ import 'db/database_helper.dart';
 import 'providers/theme_provider.dart';
 import 'providers/app_lock_provider.dart';
 import 'services/security/auth_service.dart';
+import 'services/security/build_gate_service.dart';
+import 'services/security/trial_gate_service.dart';
 import 'services/security/migration_service.dart';
 import 'services/security/screenshot_service.dart';
 import 'utils/currency.dart';
@@ -34,9 +36,13 @@ void main() async {
   final authService = AuthService();
   final themeProvider = ThemeProvider();
   final appLockProvider = AppLockProvider(authService);
+  final buildGateService = BuildGateService();
+  final trialGateService = TrialGateService();
 
   // Critical: detect vault state before first frame
   await authService.init();
+  await buildGateService.init();
+  await trialGateService.init();
 
   // Apply screenshot preference (overrides default FLAG_SECURE)
   await ScreenshotService.apply();
@@ -49,6 +55,8 @@ void main() async {
   runApp(
     MultiProvider(
       providers: [
+        ChangeNotifierProvider(create: (_) => buildGateService),
+        ChangeNotifierProvider(create: (_) => trialGateService),
         ChangeNotifierProvider(create: (_) => themeProvider),
         ChangeNotifierProvider(create: (_) => authService),
         ChangeNotifierProvider(create: (_) => appLockProvider),

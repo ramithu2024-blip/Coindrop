@@ -1,0 +1,101 @@
+import 'constants.dart';
+
+class EnvelopeIconMapper {
+  static const Map<String, String> _iconMap = {
+    'groceries': 'shopping_cart',
+    'bills': 'receipt_long',
+    'transport': 'directions_car',
+    'transportation': 'directions_car',
+    'car': 'directions_car',
+    'gas': 'local_gas_station',
+    'fuel': 'local_gas_station',
+    'savings': 'savings',
+    'fun': 'sports_esports',
+    'food': 'restaurant',
+    'dining': 'restaurant',
+    'study': 'school',
+    'education': 'school',
+    'entertainment': 'movie',
+    'essentials': 'local_mall',
+    'rent': 'home',
+    'home': 'home',
+    'mortgage': 'home',
+    'utilities': 'home',
+    'electricity': 'home',
+    'internet': 'home',
+    'emergency': 'security',
+    'health': 'health_and_safety',
+    'medical': 'medical_services',
+    'insurance': 'health_and_safety',
+    'salary': 'attach_money',
+    'income': 'attach_money',
+    'pay': 'attach_money',
+    'coffee': 'coffee',
+    'shopping': 'shopping_cart',
+    'clothing': 'checkroom',
+    'travel': 'flight',
+    'vacation': 'flight',
+    'subscriptions': 'payments',
+    'fitness': 'fitness_center',
+    'gym': 'fitness_center',
+    'pets': 'pets',
+    'phone': 'phone_android',
+    'mobile': 'phone_android',
+    'charity': 'payments',
+    'water': 'water_drop',
+    'dining out': 'restaurant',
+    'takeaway': 'restaurant',
+    'laundry': 'local_laundry_service',
+    'cleaning': 'cleaning_services',
+    'repairs': 'handyman',
+    'maintenance': 'handyman',
+    'gifts': 'card_giftcard',
+    'personal care': 'checkroom',
+    'beauty': 'checkroom',
+    'pension': 'account_balance',
+    'investment': 'account_balance',
+    'investments': 'account_balance',
+    'loan': 'credit_card',
+    'debt': 'credit_card',
+  };
+
+  static const Map<String, int> _colorMap = {
+    'groceries': 0xFF4CAF50,
+    'bills': 0xFFF44336,
+    'transport': 0xFFFF9800,
+    'transportation': 0xFFFF9800,
+    'car': 0xFFFF9800,
+    'savings': 0xFF2196F3,
+    'fun': 0xFF9C27B0,
+    'food': 0xFFFF5722,
+    'dining': 0xFFFF5722,
+    'study': 0xFF00BCD4,
+    'education': 0xFF00BCD4,
+    'entertainment': 0xFFE91E63,
+    'essentials': 0xFF795548,
+    'rent': 0xFF607D8B,
+    'utilities': 0xFF607D8B,
+    'emergency': 0xFFF44336,
+    'health': 0xFF4CAF50,
+    'medical': 0xFF4CAF50,
+    'salary': 0xFF4CAF50,
+    'income': 0xFF4CAF50,
+    'coffee': 0xFF795548,
+    'shopping': 0xFFE91E63,
+    'travel': 0xFF9C27B0,
+    'fitness': 0xFFFF9800,
+    'pets': 0xFFFF9800,
+    'phone': 0xFF00BCD4,
+    'charity': 0xFF2196F3,
+  };
+
+  static String iconKeyFor(String name) {
+    final key = name.trim().toLowerCase();
+    return _iconMap[key] ?? 'wallet';
+  }
+
+  static int colorFor(String name) {
+    final key = name.trim().toLowerCase();
+    return _colorMap[key] ?? EnvelopeColors.defaultColor;
+  }
+}

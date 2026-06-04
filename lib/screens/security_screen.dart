@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'pin_screen.dart';
 import '../widgets/pin_input_widget.dart';
 import '../services/security/auth_service.dart';
 import '../services/security/screenshot_service.dart';
+import '../services/security/trial_gate_service.dart';
 
 class SecurityScreen extends StatefulWidget {
   const SecurityScreen({super.key});
@@ -19,6 +22,7 @@ class _SecurityScreenState extends State<SecurityScreen> {
   bool _biometricAvailable = false;
   bool _screenshotBlocked = true;
   bool _encryptionEnabled = true;
+  bool _trialUnlocked = false;
 
   @override
   void initState() {
@@ -39,6 +43,7 @@ class _SecurityScreenState extends State<SecurityScreen> {
       _biometricAvailable = auth.biometricAvailable;
       _screenshotBlocked = screenshotBlocked;
       _encryptionEnabled = auth.encryptionEnabled;
+      _trialUnlocked = context.read<TrialGateService>().isUnlocked;
     });
   }
 
@@ -72,6 +77,9 @@ class _SecurityScreenState extends State<SecurityScreen> {
             ),
             _buildActionTile(colors, Icons.refresh, 'Change PIN', 'Update your vault PIN', _showChangePinDialog),
             _buildActionTile(colors, Icons.dangerous_outlined, 'Destroy Vault', 'Permanently delete all data', _showDestroyVaultDialog),
+            if (!_trialUnlocked)
+              _buildActionTile(colors, Icons.vpn_key, 'Unlock Lifetime Access',
+                'Enter code to remove trial limit', _showUnlockTrialDialog),
           ],
           if (_biometricAvailable) ...[
             const SizedBox(height: 24),
@@ -284,78 +292,12 @@ class _SecurityScreenState extends State<SecurityScreen> {
   }
 
   Future<void> _showChangePinDialog() async {
-    final oldPinCtrl = TextEditingController();
-    final newPinCtrl = TextEditingController();
-    final confirmCtrl = TextEditingController();
-    final colors = Theme.of(context).colorScheme;
-
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: colors.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text('Change PIN', style: TextStyle(color: colors.onSurface)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: oldPinCtrl, obscureText: true, maxLength: 4,
-              keyboardType: TextInputType.number,
-              style: TextStyle(color: colors.onSurface),
-              decoration: InputDecoration(
-                hintText: 'Current PIN', counterText: '',
-                hintStyle: TextStyle(color: colors.onSurface.withAlpha(80)),
-                filled: true, fillColor: colors.onSurface.withAlpha(10),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: newPinCtrl, obscureText: true, maxLength: 4,
-              keyboardType: TextInputType.number,
-              style: TextStyle(color: colors.onSurface),
-              decoration: InputDecoration(
-                hintText: 'New PIN', counterText: '',
-                hintStyle: TextStyle(color: colors.onSurface.withAlpha(80)),
-                filled: true, fillColor: colors.onSurface.withAlpha(10),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: confirmCtrl, obscureText: true, maxLength: 4,
-              keyboardType: TextInputType.number,
-              style: TextStyle(color: colors.onSurface),
-              decoration: InputDecoration(
-                hintText: 'Confirm new PIN', counterText: '',
-                hintStyle: TextStyle(color: colors.onSurface.withAlpha(80)),
-                filled: true, fillColor: colors.onSurface.withAlpha(10),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              if (newPinCtrl.text.length != 4) return;
-              if (newPinCtrl.text != confirmCtrl.text) return;
-              try {
-                await context.read<AuthService>().changePin(oldPinCtrl.text, newPinCtrl.text);
-                Navigator.pop(ctx, true);
-              } catch (_) {
-                ScaffoldMessenger.of(ctx).showSnackBar(
-                  SnackBar(content: Text('Failed: $_'), behavior: SnackBarBehavior.floating),
-                );
-              }
-            },
-            child: Text('Change PIN'),
-          ),
-        ],
+    final result = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const PinScreen(mode: PinMode.change),
       ),
     );
-
     if (result == true && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: const Text('PIN changed successfully'), behavior: SnackBarBehavior.floating),
@@ -382,8 +324,9 @@ class _SecurityScreenState extends State<SecurityScreen> {
               style: TextStyle(color: colors.onSurface, fontSize: 14)),
             const SizedBox(height: 16),
             TextField(
-              controller: confirmCtrl, maxLength: 4,
+              controller: confirmCtrl, obscureText: true, maxLength: 4,
               keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
               style: TextStyle(color: colors.onSurface),
               decoration: InputDecoration(
                 hintText: 'Enter your PIN to confirm',
@@ -417,6 +360,73 @@ class _SecurityScreenState extends State<SecurityScreen> {
         SnackBar(content: const Text('Vault destroyed. App reset.'), behavior: SnackBarBehavior.floating),
       );
       Navigator.pushReplacementNamed(context, '/');
+    }
+  }
+
+  Future<void> _showUnlockTrialDialog() async {
+    final codeCtl = TextEditingController();
+    final colors = Theme.of(context).colorScheme;
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: colors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text('Unlock Lifetime Access', style: TextStyle(color: colors.onSurface)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'Enter your license code to remove the 7-day trial limit.',
+              style: TextStyle(color: colors.onSurface.withAlpha(150), fontSize: 14),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: codeCtl,
+              obscureText: true,
+              maxLength: 32,
+              textAlign: TextAlign.center,
+              style: TextStyle(color: colors.onSurface, fontSize: 16, letterSpacing: 4),
+              decoration: InputDecoration(
+                hintText: 'License code',
+                counterText: '',
+                hintStyle: TextStyle(color: colors.onSurface.withAlpha(80)),
+                filled: true,
+                fillColor: colors.onSurface.withAlpha(10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final trial = context.read<TrialGateService>();
+              final ok = await trial.attemptUnlock(codeCtl.text.trim());
+              if (!ctx.mounted) return;
+              if (ok) {
+                Navigator.pop(ctx, true);
+              } else {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  SnackBar(content: const Text('Invalid code'), behavior: SnackBarBehavior.floating),
+                );
+              }
+            },
+            child: Text('Unlock'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == true && mounted) {
+      setState(() => _trialUnlocked = true);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: const Text('Lifetime access unlocked!'), behavior: SnackBarBehavior.floating),
+      );
     }
   }
 
@@ -490,16 +500,12 @@ class _SecurityScreenState extends State<SecurityScreen> {
       return;
     }
 
-    // Step 2: Progress dialog with ValueNotifier
     final progressMsg = ValueNotifier('');
 
     void updateProgress(String msg) {
       progressMsg.value = msg;
     }
 
-    // Close the PIN verify dialog first (already popped by Navigator.pop above).
-    // Now show the progress dialog.
-    // ignore: use_build_context_synchronously
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -525,32 +531,41 @@ class _SecurityScreenState extends State<SecurityScreen> {
     try {
       final db = auth.dbHelper;
 
-      // Step 3: Do the work
+      // Step 3: Export data FIRST before any destructive operations
       updateProgress('Exporting data from database...');
       final data = await db.exportAllData();
-
-      if (enable) {
-        updateProgress('Encrypting database...');
-        final keyHex = await auth.deriveKeyHexFromPin(pinCtrl.text);
+      if (data.values.every((l) => l.isEmpty)) {
+        // Empty DB -- just re-create
         await db.deleteDatabaseFile();
-        await db.open(keyHex);
-        auth.setEncryptionEnabled(true);
+        if (enable) {
+          final keyHex = await auth.deriveKeyHexFromPin(pinCtrl.text);
+          await db.open(keyHex);
+          auth.setEncryptionEnabled(true);
+        } else {
+          await db.openPlain();
+          auth.setEncryptionEnabled(false);
+        }
       } else {
-        updateProgress('Decrypting database...');
+        // Data present -- safe re-create with import
         await db.deleteDatabaseFile();
-        await db.openPlain();
-        auth.setEncryptionEnabled(false);
+        if (enable) {
+          updateProgress('Encrypting database...');
+          final keyHex = await auth.deriveKeyHexFromPin(pinCtrl.text);
+          await db.open(keyHex);
+          auth.setEncryptionEnabled(true);
+        } else {
+          updateProgress('Decrypting database...');
+          await db.openPlain();
+          auth.setEncryptionEnabled(false);
+        }
+        updateProgress('Importing data into database...');
+        await db.importAllData(data);
       }
-
-      updateProgress('Importing data into database...');
-      await db.importAllData(data);
 
       updateProgress('Done!');
 
-      // ignore: use_build_context_synchronously
-      if (mounted) Navigator.pop(context); // close progress dialog
+      if (mounted) Navigator.pop(context);
 
-      // ignore: use_build_context_synchronously
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(enable
@@ -561,13 +576,10 @@ class _SecurityScreenState extends State<SecurityScreen> {
         ),
       );
 
-      // ignore: use_build_context_synchronously
       setState(() {});
     } catch (e) {
-      // ignore: use_build_context_synchronously
-      if (mounted) Navigator.pop(context); // close progress dialog
+      if (mounted) Navigator.pop(context);
 
-      // ignore: use_build_context_synchronously
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Failed to ${enable ? 'enable' : 'disable'} encryption: $e'),

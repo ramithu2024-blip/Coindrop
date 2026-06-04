@@ -27,6 +27,17 @@ class EnvelopeIcons {
     'phone_android': Icons.phone_android,
     'checkroom': Icons.checkroom,
     'health_and_safety': Icons.health_and_safety,
+    'receipt_long': Icons.receipt_long,
+    'attach_money': Icons.attach_money,
+    'security': Icons.security,
+    'wallet': Icons.account_balance_wallet,
+    'commute': Icons.commute,
+    'shield': Icons.shield,
+    'water_drop': Icons.water_drop,
+    'local_laundry_service': Icons.local_laundry_service,
+    'cleaning_services': Icons.cleaning_services,
+    'handyman': Icons.handyman,
+    'card_giftcard': Icons.card_giftcard,
   };
 
   static IconData getIcon(String? name) {

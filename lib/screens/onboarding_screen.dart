@@ -1,12 +1,15 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../providers/theme_provider.dart';
+import '../l10n/app_strings.dart';
+import '../models/envelope.dart';
 import '../services/security/auth_service.dart';
-import '../widgets/color_picker/color_picker_dialog.dart';
-import 'pin_screen.dart';
+import '../providers/theme_provider.dart';
+import '../providers/envelope_provider.dart';
 import '../utils/currency.dart' show setCurrency;
+import '../utils/envelope_icon_mapper.dart';
 
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
@@ -16,65 +19,155 @@ class OnboardingScreen extends StatefulWidget {
 }
 
 class _OnboardingScreenState extends State<OnboardingScreen> {
-  final _pageController = PageController();
   int _currentPage = 0;
-  bool _biometricAvailable = false;
+  late final List<Widget> _pages;
+  String? _pendingPin;
+  bool _pendingBiometric = false;
+  bool _isFinishing = false;
 
   @override
   void initState() {
     super.initState();
-    _initState();
-  }
-
-  Future<void> _initState() async {
-    final auth = context.read<AuthService>();
-    setState(() => _biometricAvailable = auth.biometricAvailable);
-  }
-
-  @override
-  void dispose() {
-    _pageController.dispose();
-    super.dispose();
+    _pages = [
+      const _WelcomePage(),
+      const _PainPointPage(),
+      _ThemePage(onNext: _nextPage),
+      _SecurityPage(onSavePin: _onSavePin),
+      const _CurrencyPage(),
+      _PaydaySetupPage(onNext: _nextPage),
+      _StartingBalancePage(onNext: _nextPage),
+      _EnvelopeSetupPage(onNext: _nextPage),
+      _FinishPage(onFinish: _finishOnboarding),
+    ];
   }
 
   void _nextPage() {
     if (_currentPage < _pages.length - 1) {
-      _pageController.nextPage(
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeInOut,
-      );
+      setState(() => _currentPage++);
     }
   }
 
-  List<Widget> get _pages => [
-        _WelcomePage(onNext: _nextPage),
-        _ThemePage(onNext: _nextPage),
-        _CurrencyPage(onNext: _nextPage),
-        if (_biometricAvailable)
-          _BiometricsPage(onNext: _nextPage),
-        _PaydaySetupPage(onNext: _nextPage),
-        _StartingBalancePage(onNext: _nextPage),
-        _BudgetModePage(onNext: _nextPage),
-        _FinishPage(
-          onStart: () {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(
-                builder: (_) => const PinScreen(mode: PinMode.setup),
-              ),
-            );
-          },
-        ),
-      ];
+  void _onSavePin(String pin, {bool biometric = false}) {
+    _pendingPin = pin;
+    _pendingBiometric = biometric;
+    _nextPage();
+  }
 
-  void _onPageChanged(int page) {
-    setState(() => _currentPage = page);
+  Future<void> _finishOnboarding({bool tutorial = false}) async {
+    if (_isFinishing) return;
+    _isFinishing = true;
+    final auth = context.read<AuthService>();
+    if (_pendingPin == null) {
+      if (!mounted) return;
+      _isFinishing = false;
+      setState(() => _currentPage = 3);
+      return;
+    }
+
+    // Read prefs BEFORE setupPin (which may notifyListeners and unmount this widget)
+    final prefs = await SharedPreferences.getInstance();
+    final envelopeRaw = prefs.getString('onboarding_envelopes');
+
+    if (!mounted) return;
+    final ok = await auth.setupPin(_pendingPin!);
+    if (!ok) {
+      if (kDebugMode) debugPrint('[Onboarding] setupPin FAILED');
+      _isFinishing = false;
+      return;
+    }
+
+    // After setupPin, notifyListeners may have rebuilt the widget tree.
+    // Use captured auth reference — do NOT call context.read or access context.
+    if (_pendingBiometric) {
+      await auth.storeBiometricKey();
+    }
+
+    if (!auth.dbHelper.isOpen) {
+      if (kDebugMode) debugPrint('[Onboarding] DB not open — attempting reopen');
+      try {
+        final keyHex = await auth.deriveKeyHexFromPin(_pendingPin!);
+        await auth.dbHelper.open(keyHex);
+      } catch (e) {
+        if (kDebugMode) debugPrint('[Onboarding] DB reopen failed: $e');
+        _isFinishing = false;
+        return;
+      }
+    }
+
+    if (kDebugMode) debugPrint('[Onboarding] Creating recommended envelopes');
+    try {
+      await _createEnvelopesFromRaw(auth, envelopeRaw);
+    } catch (e) {
+      if (kDebugMode) debugPrint('[Onboarding] Envelope creation error (non-fatal): $e');
+    }
+
+    try {
+      await auth.importPendingOnboardingPayday();
+      await auth.importStartingBalance();
+    } catch (e) {
+      if (kDebugMode) debugPrint('[Onboarding] Import error (non-fatal): $e');
+    }
+
+    await prefs.setBool('onboarding_complete', true);
+
+    // Refresh provider state so home screen shows envelopes immediately
+    if (mounted) {
+      try {
+        await context.read<EnvelopeProvider>().loadEnvelopes();
+      } catch (_) {}
+    }
+
+    // Navigation is only possible if widget is still mounted
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (tutorial) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const _TutorialScreen()),
+        );
+      } else {
+        Navigator.pushReplacementNamed(context, '/');
+      }
+    });
+  }
+
+  Future<void> _createEnvelopesFromRaw(AuthService auth, String? raw) async {
+    if (raw == null || raw.isEmpty) {
+      if (kDebugMode) debugPrint('[Onboarding] No envelopes to create');
+      return;
+    }
+    final db = auth.dbHelper;
+    if (!db.isOpen) {
+      if (kDebugMode) debugPrint('[Onboarding] DB not open — skipping envelope creation');
+      return;
+    }
+    final now = DateTime.now().toIso8601String();
+    final names = raw.split(',');
+    if (kDebugMode) debugPrint('[Onboarding] Creating ${names.length} envelopes: $names');
+
+    // Batch all inserts atomically so the HomeScreen never sees
+    // partial data when it calls loadEnvelopes() after the widget
+    // tree rebuilds (triggered by auth.setupPin() → notifyListeners()).
+    await Future.wait(names.where((n) => n.trim().isNotEmpty).map((name) {
+      final trimmed = name.trim();
+      final icon = EnvelopeIconMapper.iconKeyFor(trimmed);
+      final color = EnvelopeIconMapper.colorFor(trimmed);
+      return db.insertEnvelope(Envelope(
+        name: trimmed,
+        initialAmount: 0,
+        createdAt: now,
+        icon: icon,
+        color: color,
+      ));
+    }));
+
+    if (kDebugMode) debugPrint('[Onboarding] Recommended envelopes created successfully');
   }
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final pageList = _pages;
 
     return Scaffold(
       backgroundColor: colors.surface,
@@ -82,13 +175,21 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         child: Column(
           children: [
             Expanded(
-              child: PageView(
-                controller: _pageController,
-                onPageChanged: _onPageChanged,
-                children: pageList,
+              child: GestureDetector(
+                onHorizontalDragEnd: (details) {
+                  if (details.primaryVelocity! < -100) {
+                    _nextPage();
+                  } else if (details.primaryVelocity! > 100 && _currentPage > 0) {
+                    setState(() => _currentPage--);
+                  }
+                },
+                child: IndexedStack(
+                  index: _currentPage,
+                  children: _pages,
+                ),
               ),
             ),
-            _buildIndicator(colors, pageList.length),
+            _buildIndicator(colors, _pages.length),
             const SizedBox(height: 24),
           ],
         ),
@@ -113,13 +214,77 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       }),
     );
   }
-
 }
 
-class _WelcomePage extends StatelessWidget {
-  final VoidCallback onNext;
+// ---------------------------------------------------------------------------
+// 1. Welcome
+// ---------------------------------------------------------------------------
 
-  const _WelcomePage({required this.onNext});
+class _WelcomePage extends StatelessWidget {
+  const _WelcomePage();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final textColor = colors.onSurface;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 80, height: 80,
+              decoration: BoxDecoration(
+                color: colors.primary.withAlpha(20),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Icon(Icons.account_balance_wallet_outlined, size: 40, color: colors.primary),
+            ),
+            const SizedBox(height: 32),
+            Text(AppStrings.welcomeTitle,
+              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: textColor)),
+            const SizedBox(height: 12),
+            Text(AppStrings.welcomeSubtitle,
+              style: TextStyle(fontSize: 15, color: textColor.withAlpha(150), height: 1.5),
+              textAlign: TextAlign.center),
+            const SizedBox(height: 32),
+            FilledButton(
+              onPressed: () => context.findAncestorStateOfType<_OnboardingScreenState>()?._nextPage(),
+              style: FilledButton.styleFrom(
+                backgroundColor: colors.primary,
+                foregroundColor: colors.onPrimary,
+                minimumSize: const Size(200, 48),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              child: Text(AppStrings.welcomeCta, style: const TextStyle(fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Pain Point — Choose your situation
+// ---------------------------------------------------------------------------
+
+class _PainPointPage extends StatefulWidget {
+  const _PainPointPage();
+  @override
+  State<_PainPointPage> createState() => _PainPointPageState();
+}
+
+class _PainPointPageState extends State<_PainPointPage> {
+  int _selectedIndex = -1;
+
+  void _select(int index) {
+    setState(() {
+      _selectedIndex = index;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -134,73 +299,63 @@ class _WelcomePage extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 100,
-                height: 100,
+                width: 80, height: 80,
                 decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [colors.primary.withAlpha(60), colors.primary.withAlpha(20)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(28),
-                  border: Border.all(color: colors.primary.withAlpha(40)),
+                  color: colors.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(24),
                 ),
-                child: Icon(Icons.account_balance_wallet, size: 50, color: colors.primary),
+                child: Icon(Icons.psychology_outlined, size: 40, color: colors.primary),
               ),
-              const SizedBox(height: 40),
-              Text(
-                'Welcome to CoinDrop',
-                style: TextStyle(
-                  fontSize: 28,
-                  fontWeight: FontWeight.bold,
-                  color: textColor,
-                  letterSpacing: 0.5,
-                ),
+              const SizedBox(height: 32),
+              Text(AppStrings.painPointTitle,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
+              const SizedBox(height: 8),
+              Text(AppStrings.painPointSubtitle,
+                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 16),
-              Text(
-                'Take control of your finances with digital cash envelopes.\n'
-                'Your data stays on your device — fully encrypted.',
-                style: TextStyle(
-                  fontSize: 15,
-                  color: textColor.withAlpha(150),
-                  height: 1.5,
-                ),
-                textAlign: TextAlign.center,
+              const SizedBox(height: 24),
+              _PainPointOption(
+                label: AppStrings.painPointSpend,
+                isSelected: _selectedIndex == 0,
+                onTap: () => _select(0),
+                colors: colors,
+                textColor: textColor,
               ),
-              const SizedBox(height: 12),
-              Container(
-                margin: const EdgeInsets.symmetric(vertical: 8),
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: colors.primary.withAlpha(10),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: colors.primary.withAlpha(20)),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.shield_outlined, size: 20, color: colors.primary),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        'End-to-end encrypted with SQLCipher.\nYour PIN is your key.',
-                        style: TextStyle(color: colors.primary, fontSize: 13, height: 1.4),
-                      ),
-                    ),
-                  ],
-                ),
+              const SizedBox(height: 8),
+              _PainPointOption(
+                label: AppStrings.painPointConfusing,
+                isSelected: _selectedIndex == 1,
+                onTap: () => _select(1),
+                colors: colors,
+                textColor: textColor,
+              ),
+              const SizedBox(height: 8),
+              _PainPointOption(
+                label: AppStrings.painPointControl,
+                isSelected: _selectedIndex == 2,
+                onTap: () => _select(2),
+                colors: colors,
+                textColor: textColor,
+              ),
+              const SizedBox(height: 8),
+              _PainPointOption(
+                label: AppStrings.painPointCloud,
+                isSelected: _selectedIndex == 3,
+                onTap: () => _select(3),
+                colors: colors,
+                textColor: textColor,
               ),
               const SizedBox(height: 32),
               FilledButton(
-                onPressed: onNext,
+                onPressed: () => context.findAncestorStateOfType<_OnboardingScreenState>()?._nextPage(),
                 style: FilledButton.styleFrom(
                   backgroundColor: colors.primary,
                   foregroundColor: colors.onPrimary,
-                  minimumSize: const Size(200, 54),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                 ),
-                child: const Text('Get Started', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                child: const Text(AppStrings.painPointCta, style: TextStyle(fontWeight: FontWeight.w600)),
               ),
             ],
           ),
@@ -210,15 +365,118 @@ class _WelcomePage extends StatelessWidget {
   }
 }
 
-class _ThemePage extends StatelessWidget {
-  final VoidCallback onNext;
+class _PainPointOption extends StatelessWidget {
+  final String label;
+  final bool isSelected;
+  final VoidCallback onTap;
+  final ColorScheme colors;
+  final Color textColor;
 
+  const _PainPointOption({
+    required this.label,
+    required this.isSelected,
+    required this.onTap,
+    required this.colors,
+    required this.textColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+        decoration: BoxDecoration(
+          color: isSelected ? colors.primary.withAlpha(18) : colors.onSurface.withAlpha(8),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isSelected ? colors.primary : colors.onSurface.withAlpha(20),
+            width: isSelected ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              isSelected ? Icons.check_circle : Icons.arrow_forward_ios,
+              size: 16,
+              color: isSelected ? colors.primary : colors.primary.withAlpha(120),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(label,
+                style: TextStyle(
+                  color: isSelected ? colors.primary : textColor,
+                  fontSize: 15,
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Theme — Light/Dark/System + Accent color
+// ---------------------------------------------------------------------------
+
+class _ThemePage extends StatefulWidget {
+  final VoidCallback onNext;
   const _ThemePage({required this.onNext});
+
+  @override
+  State<_ThemePage> createState() => _ThemePageState();
+}
+
+class _ThemePageState extends State<_ThemePage> {
+  ThemeModeOption _option = ThemeModeOption.system;
+  int _accentValue = 0xFF4CAF50;
+  bool _cashAccent = true;
+  bool _customColors = true;
+  late final ThemeProvider _theme;
+
+  @override
+  void initState() {
+    super.initState();
+    _theme = context.read<ThemeProvider>();
+    _option = _theme.themeModeOption;
+    _accentValue = _theme.accentColorValue;
+    _cashAccent = _theme.cashIconAccent;
+    _customColors = _theme.useCustomEnvelopeColors;
+  }
+
+  void _setThemeMode(ThemeModeOption opt) {
+    setState(() => _option = opt);
+    _theme.setThemeMode(opt);
+  }
+
+  void _setAccent(int value) {
+    setState(() => _accentValue = value);
+    _theme.setAccentColor(value);
+  }
+
+  void _setCashAccent(bool v) {
+    setState(() => _cashAccent = v);
+    _theme.setCashIconAccent(v);
+  }
+
+  void _setCustomColors(bool v) {
+    setState(() => _customColors = v);
+    _theme.setUseCustomEnvelopeColors(v);
+  }
+
+  void _onContinue() {
+    FocusScope.of(context).unfocus();
+    widget.onNext();
+  }
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final themeProvider = context.watch<ThemeProvider>();
     final textColor = colors.onSurface;
 
     return Padding(
@@ -229,8 +487,7 @@ class _ThemePage extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 80,
-                height: 80,
+                width: 80, height: 80,
                 decoration: BoxDecoration(
                   color: colors.primary.withAlpha(20),
                   borderRadius: BorderRadius.circular(24),
@@ -238,184 +495,119 @@ class _ThemePage extends StatelessWidget {
                 child: Icon(Icons.palette_outlined, size: 40, color: colors.primary),
               ),
               const SizedBox(height: 32),
-              Text(
-                'Choose Your Style',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: textColor,
-                ),
-              ),
+              Text(AppStrings.appearanceTitle,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
               const SizedBox(height: 8),
-              Text(
-                'Pick an accent color that suits you.\nYou can change it later in Settings.',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: textColor.withAlpha(150),
-                  height: 1.4,
-                ),
+              Text(AppStrings.appearanceSubtitle,
+                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 24),
               Wrap(
-                spacing: 12,
-                runSpacing: 12,
+                spacing: 8, runSpacing: 8,
                 alignment: WrapAlignment.center,
-                children: [
-                  ...AccentColorOption.all.map((option) {
-                    final isSelected = option.value == themeProvider.accentColorValue;
-                    return GestureDetector(
-                      onTap: () => themeProvider.setAccentColor(option.value),
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          color: option.color,
-                          shape: BoxShape.circle,
-                          border: isSelected
-                              ? Border.all(color: colors.onSurface, width: 3)
-                              : null,
-                          boxShadow: isSelected
-                              ? [BoxShadow(color: option.color.withAlpha(100), blurRadius: 12, spreadRadius: 2)]
-                              : null,
-                        ),
-                        child: isSelected
-                            ? const Icon(Icons.check, color: Colors.white, size: 22)
-                            : null,
-                      ),
-                    );
-                  }),
-                  GestureDetector(
-                    onTap: () async {
-                      final color = await showColorPicker(
-                        context,
-                        initialColor: themeProvider.accentColor,
-                      );
-                      if (color != null) {
-                        themeProvider.setAccentColor(color.value);
-                      }
-                    },
+                children: ThemeModeOption.values.map((opt) {
+                  final selected = _option == opt;
+                  return ChoiceChip(
+                    label: Text(opt.label),
+                    selected: selected,
+                    onSelected: (_) => _setThemeMode(opt),
+                    selectedColor: colors.primary.withAlpha(30),
+                    backgroundColor: colors.onSurface.withAlpha(10),
+                    labelStyle: TextStyle(
+                      color: selected ? colors.primary : textColor.withAlpha(150),
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                    ),
+                    side: BorderSide(
+                      color: selected ? colors.primary : colors.onSurface.withAlpha(20),
+                    ),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 24),
+              Text(AppStrings.appearanceAccent,
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: textColor)),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 12, runSpacing: 12,
+                alignment: WrapAlignment.center,
+                children: AccentColorOption.all.map((opt) {
+                  final selected = _accentValue == opt.value;
+                  return GestureDetector(
+                    onTap: () => _setAccent(opt.value),
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 200),
-                      width: 48,
-                      height: 48,
+                      width: 40, height: 40,
                       decoration: BoxDecoration(
+                        color: opt.color,
                         shape: BoxShape.circle,
-                        border: Border.all(
-                          color: themeProvider.accentOption.isCustom
-                              ? colors.onSurface
-                              : colors.onSurface.withAlpha(80),
-                          width: themeProvider.accentOption.isCustom ? 3 : 2,
-                        ),
-                        gradient: themeProvider.accentOption.isCustom
-                            ? null
-                            : const SweepGradient(
-                                colors: [
-                                  Color(0xFFFF0000),
-                                  Color(0xFFFF8800),
-                                  Color(0xFFFFFF00),
-                                  Color(0xFF00FF00),
-                                  Color(0xFF0088FF),
-                                  Color(0xFF8800FF),
-                                  Color(0xFFFF0000),
-                                ],
-                              ),
-                        color: themeProvider.accentOption.isCustom
-                            ? themeProvider.accentColor
-                            : null,
-                        boxShadow: themeProvider.accentOption.isCustom
-                            ? [BoxShadow(color: themeProvider.accentColor.withAlpha(100), blurRadius: 12, spreadRadius: 2)]
+                        border: selected
+                            ? Border.all(color: colors.onSurface, width: 3)
+                            : Border.all(color: Colors.transparent),
+                        boxShadow: selected
+                            ? [BoxShadow(color: opt.color.withAlpha(100), blurRadius: 8)]
                             : null,
                       ),
-                      child: themeProvider.accentOption.isCustom
-                          ? const Icon(Icons.check, color: Colors.white, size: 22)
-                          : Icon(Icons.colorize, size: 20, color: Colors.white.withAlpha(180)),
+                      child: selected
+                          ? Icon(Icons.check, color: Colors.white, size: 20)
+                          : null,
                     ),
-                  ),
-                ],
+                  );
+                }).toList(),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 24),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 decoration: BoxDecoration(
-                  color: colors.onSurface.withAlpha(10),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.payments, size: 20,
-                      color: themeProvider.cashIconAccent ? themeProvider.accentColor : colors.onSurface.withAlpha(120)),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text('Color cash icon with accent', style: TextStyle(
-                        color: colors.onSurface, fontSize: 13,
-                      )),
-                    ),
-                    Switch(
-                      value: themeProvider.cashIconAccent,
-                      activeColor: colors.primary,
-                      onChanged: (v) => themeProvider.setCashIconAccent(v),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: colors.onSurface.withAlpha(10),
+                  color: colors.primary.withAlpha(8),
                   borderRadius: BorderRadius.circular(14),
                 ),
                 child: Column(
                   children: [
-                    ...ThemeModeOption.values.map((option) {
-                      final selected = option == themeProvider.themeModeOption;
-                      return InkWell(
-                        onTap: () => themeProvider.setThemeMode(option),
-                        borderRadius: BorderRadius.circular(12),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                          child: Row(
-                            children: [
-                              Icon(
-                                option == ThemeModeOption.dark ? Icons.dark_mode :
-                                option == ThemeModeOption.light ? Icons.light_mode :
-                                option == ThemeModeOption.system ? Icons.settings_brightness :
-                                Icons.schedule,
-                                size: 20,
-                                color: selected ? colors.primary : textColor.withAlpha(120),
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                option.label,
-                                style: TextStyle(
-                                  color: selected ? colors.primary : textColor,
-                                  fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
-                                  fontSize: 14,
-                                ),
-                              ),
-                              const Spacer(),
-                              if (selected)
-                                Icon(Icons.check_circle, size: 20, color: colors.primary),
-                            ],
-                          ),
+                    Row(
+                      children: [
+                        Icon(Icons.monetization_on_outlined, size: 20, color: colors.primary),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(AppStrings.appearanceCashAccent,
+                            style: TextStyle(fontSize: 14, color: textColor)),
                         ),
-                      );
-                    }),
+                        Switch(
+                          value: _cashAccent,
+                          onChanged: (v) => _setCashAccent(v),
+                          activeColor: colors.primary,
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 1, indent: 32),
+                    Row(
+                      children: [
+                        Icon(Icons.palette_outlined, size: 20, color: colors.primary),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(AppStrings.appearanceCustomColors,
+                            style: TextStyle(fontSize: 14, color: textColor)),
+                        ),
+                        Switch(
+                          value: _customColors,
+                          onChanged: (v) => _setCustomColors(v),
+                          activeColor: colors.primary,
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
               const SizedBox(height: 32),
               FilledButton(
-                onPressed: onNext,
+                onPressed: _onContinue,
                 style: FilledButton.styleFrom(
                   backgroundColor: colors.primary,
                   foregroundColor: colors.onPrimary,
-                  minimumSize: const Size(200, 54),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                 ),
-                child: const Text('Continue', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                child: const Text(AppStrings.continueLabel, style: TextStyle(fontWeight: FontWeight.w600)),
               ),
             ],
           ),
@@ -425,16 +617,254 @@ class _ThemePage extends StatelessWidget {
   }
 }
 
-class _CurrencyPage extends StatefulWidget {
-  final VoidCallback onNext;
+// ---------------------------------------------------------------------------
+// 4. Security — PIN creation + optional biometric
+// ---------------------------------------------------------------------------
 
-  const _CurrencyPage({required this.onNext});
+class _SecurityPage extends StatefulWidget {
+  final void Function(String pin, {bool biometric}) onSavePin;
+  const _SecurityPage({required this.onSavePin});
 
   @override
-  State<_CurrencyPage> createState() => _CurrencyPageState();
+  State<_SecurityPage> createState() => _SecurityPageState();
 }
 
-class _CurrencyPageState extends State<_CurrencyPage> {
+class _SecurityPageState extends State<_SecurityPage> {
+  final _pinCtl = TextEditingController();
+  final _confirmCtl = TextEditingController();
+  final _pinFocus = FocusNode();
+  final _confirmFocus = FocusNode();
+  bool _showConfirm = false;
+  bool _biometricEnabled = false;
+  bool _loading = false;
+  bool _biometricAvailable = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final auth = context.read<AuthService>();
+    _biometricAvailable = auth.biometricAvailable;
+  }
+
+  @override
+  void dispose() {
+    _pinCtl.dispose();
+    _confirmCtl.dispose();
+    _pinFocus.dispose();
+    _confirmFocus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (_loading) return;
+    if (_pinCtl.text.length != 4) {
+      setState(() => _error = AppStrings.pinErrorLength);
+      return;
+    }
+    if (!_showConfirm) {
+      setState(() { _showConfirm = true; _error = null; });
+      WidgetsBinding.instance.addPostFrameCallback((_) => _confirmFocus.requestFocus());
+      return;
+    }
+    if (_pinCtl.text != _confirmCtl.text) {
+      setState(() => _error = AppStrings.pinErrorMismatch);
+      return;
+    }
+    setState(() { _loading = true; _error = null; });
+    FocusScope.of(context).unfocus();
+    if (_biometricAvailable && _biometricEnabled) {
+      final auth = context.read<AuthService>();
+      await auth.setBiometricUserEnabled(true);
+    }
+    widget.onSavePin(_pinCtl.text, biometric: _biometricAvailable && _biometricEnabled);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final textColor = colors.onSurface;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Center(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 80, height: 80,
+                decoration: BoxDecoration(
+                  color: colors.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Icon(Icons.lock_outline, size: 40, color: colors.primary),
+              ),
+              const SizedBox(height: 32),
+              Text(
+                _showConfirm ? AppStrings.pinConfirmTitle : AppStrings.pinCreateTitle,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _showConfirm ? AppStrings.pinConfirmSubtitle : AppStrings.pinCreateSubtitle,
+                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 24),
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: colors.primary.withAlpha(8),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  children: [
+                    _PinField(
+                      controller: _showConfirm ? _confirmCtl : _pinCtl,
+                      focusNode: _showConfirm ? _confirmFocus : _pinFocus,
+                      colors: colors,
+                    ),
+                    if (!_showConfirm && _biometricAvailable) ...[
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.fingerprint, size: 20, color: _biometricEnabled ? colors.primary : colors.onSurface.withAlpha(80)),
+                          const SizedBox(width: 8),
+                          Text(AppStrings.pinBiometricLabel, style: TextStyle(color: textColor, fontSize: 14)),
+                          const SizedBox(width: 8),
+                          Switch(
+                            value: _biometricEnabled,
+                            activeColor: colors.primary,
+                            onChanged: (v) => setState(() => _biometricEnabled = v),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                Text(_error!, style: TextStyle(color: Colors.redAccent, fontSize: 13)),
+              ],
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: _loading ? null : _save,
+                style: FilledButton.styleFrom(
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: Text(
+                  _loading ? AppStrings.pinCtaLoading : (_showConfirm ? AppStrings.pinCtaConfirm : AppStrings.pinCtaInitial),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              if (_showConfirm) ...[
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () => setState(() { _showConfirm = false; _error = null; }),
+                  child: Text(AppStrings.pinBack, style: TextStyle(color: colors.onSurface.withAlpha(120))),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PinField extends StatelessWidget {
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final ColorScheme colors;
+
+  const _PinField({
+    required this.controller,
+    required this.focusNode,
+    required this.colors,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      focusNode: focusNode,
+      maxLength: 4,
+      obscureText: true,
+      keyboardType: TextInputType.number,
+      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+      textAlign: TextAlign.center,
+      style: TextStyle(color: colors.onSurface, fontSize: 28, fontWeight: FontWeight.bold, letterSpacing: 12),
+      decoration: InputDecoration(
+        counterText: '',
+        filled: true,
+        fillColor: colors.onSurface.withAlpha(12),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.onSurface.withAlpha(25)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.onSurface.withAlpha(25)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: colors.primary, width: 2),
+        ),
+        contentPadding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Currency
+// ---------------------------------------------------------------------------
+
+class _CurrencyPage extends StatelessWidget {
+  const _CurrencyPage();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final textColor = colors.onSurface;
+
+    const currencies = [
+      ('en_AU', '\$', 'Australian Dollar (\$AUD)'),
+      ('en_US', '\$', 'US Dollar (\$USD)'),
+      ('en_GB', '£', 'British Pound (£GBP)'),
+      ('de_DE', '€', 'Euro (€EUR)'),
+    ];
+
+    return _CurrencyPageBody(
+      colors: colors,
+      textColor: textColor,
+      currencies: currencies,
+    );
+  }
+}
+
+class _CurrencyPageBody extends StatefulWidget {
+  final ColorScheme colors;
+  final Color textColor;
+  final List<(String, String, String)> currencies;
+
+  const _CurrencyPageBody({
+    required this.colors,
+    required this.textColor,
+    required this.currencies,
+  });
+
+  @override
+  State<_CurrencyPageBody> createState() => _CurrencyPageBodyState();
+}
+
+class _CurrencyPageBodyState extends State<_CurrencyPageBody> {
   String _selectedLocale = 'en_AU';
 
   @override
@@ -456,18 +886,6 @@ class _CurrencyPageState extends State<_CurrencyPage> {
 
   @override
   Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final textColor = colors.onSurface;
-    final themeProvider = context.watch<ThemeProvider>();
-    final iconColor = themeProvider.cashIconAccent ? themeProvider.accentColor : colors.onSurface.withAlpha(120);
-
-    final currencies = [
-      ('en_AU', '\$', 'Australian Dollar (\$AUD)'),
-      ('en_US', '\$', 'US Dollar (\$USD)'),
-      ('en_GB', '£', 'British Pound (£GBP)'),
-      ('de_DE', '€', 'Euro (€EUR)'),
-    ];
-
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
       child: Center(
@@ -478,33 +896,38 @@ class _CurrencyPageState extends State<_CurrencyPage> {
               Container(
                 width: 80, height: 80,
                 decoration: BoxDecoration(
-                  color: iconColor.withAlpha(25),
+                  color: widget.colors.primary.withAlpha(20),
                   borderRadius: BorderRadius.circular(24),
                 ),
-                child: Icon(Icons.attach_money, size: 40, color: iconColor),
+                child: Icon(Icons.attach_money, size: 40, color: widget.colors.primary),
               ),
               const SizedBox(height: 32),
-              Text('Choose Currency', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
+              Text(AppStrings.currencyTitle, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: widget.textColor)),
               const SizedBox(height: 8),
-              Text('Select your preferred currency format.',
-                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
+              Text(AppStrings.currencySubtitle,
+                style: TextStyle(fontSize: 14, color: widget.textColor.withAlpha(150), height: 1.4),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),
-              ...currencies.map((c) => Padding(
+              ...widget.currencies.map((c) => Padding(
                 padding: const EdgeInsets.only(bottom: 8),
-                child: _buildCurrencyOption(c.$1, c.$2, c.$3, colors, textColor),
+                child: _CurrencyOption(
+                  locale: c.$1, symbol: c.$2, label: c.$3,
+                  selected: _selectedLocale == c.$1,
+                  colors: widget.colors, textColor: widget.textColor,
+                  onTap: () => _select(c.$1, c.$2),
+                ),
               )),
               const SizedBox(height: 24),
               FilledButton(
-                onPressed: widget.onNext,
+                onPressed: () => context.findAncestorStateOfType<_OnboardingScreenState>()?._nextPage(),
                 style: FilledButton.styleFrom(
-                  backgroundColor: colors.primary,
-                  foregroundColor: colors.onPrimary,
+                  backgroundColor: widget.colors.primary,
+                  foregroundColor: widget.colors.onPrimary,
                   minimumSize: const Size(200, 48),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                 ),
-                child: const Text('Continue', style: TextStyle(fontWeight: FontWeight.w600)),
+                child: const Text(AppStrings.currencyCta, style: TextStyle(fontWeight: FontWeight.w600)),
               ),
             ],
           ),
@@ -512,11 +935,24 @@ class _CurrencyPageState extends State<_CurrencyPage> {
       ),
     );
   }
+}
 
-  Widget _buildCurrencyOption(String locale, String symbol, String label, ColorScheme colors, Color textColor) {
-    final selected = _selectedLocale == locale;
+class _CurrencyOption extends StatelessWidget {
+  final String locale, symbol, label;
+  final bool selected;
+  final ColorScheme colors;
+  final Color textColor;
+  final VoidCallback onTap;
+
+  const _CurrencyOption({
+    required this.locale, required this.symbol, required this.label,
+    required this.selected, required this.colors, required this.textColor, required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () => _select(locale, symbol),
+      onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         width: double.infinity,
@@ -539,349 +975,9 @@ class _CurrencyPageState extends State<_CurrencyPage> {
   }
 }
 
-class _BudgetModePage extends StatefulWidget {
-  final VoidCallback onNext;
-
-  const _BudgetModePage({required this.onNext});
-
-  @override
-  State<_BudgetModePage> createState() => _BudgetModePageState();
-}
-
-class _BudgetModePageState extends State<_BudgetModePage> {
-  String _selectedMode = 'manual';
-
-  Future<void> _saveAndContinue() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('auto_divide_enabled', _selectedMode != 'manual');
-    widget.onNext();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final textColor = colors.onSurface;
-    final themeProvider = context.watch<ThemeProvider>();
-    final iconColor = themeProvider.cashIconAccent ? themeProvider.accentColor : colors.onSurface.withAlpha(120);
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 80, height: 80,
-                decoration: BoxDecoration(
-                  color: iconColor.withAlpha(25),
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: Icon(Icons.account_balance, size: 40, color: iconColor),
-              ),
-              const SizedBox(height: 32),
-              Text('Budgeting Mode', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
-              const SizedBox(height: 8),
-              Text('Choose how you want to manage your money.',
-                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              _ModeCard(
-                icon: Icons.touch_app, title: 'Manual', description: 'You decide how much goes into each envelope. Full control.',
-                selected: _selectedMode == 'manual', colors: colors, textColor: textColor,
-                onTap: () => setState(() => _selectedMode = 'manual'),
-              ),
-              const SizedBox(height: 8),
-              _ModeCard(
-                icon: Icons.auto_graph, title: 'Auto (Percentage Split)',
-                description: 'Paydays are automatically split across envelopes by saved percentages.',
-                selected: _selectedMode == 'auto', colors: colors, textColor: textColor,
-                onTap: () => setState(() => _selectedMode = 'auto'),
-              ),
-              const SizedBox(height: 8),
-              _ModeCard(
-                icon: Icons.swap_horiz, title: 'Hybrid',
-                description: 'Auto-allocate by default, but you can manually adjust anytime.',
-                selected: _selectedMode == 'hybrid', colors: colors, textColor: textColor,
-                onTap: () => setState(() => _selectedMode = 'hybrid'),
-              ),
-              const SizedBox(height: 32),
-              FilledButton(
-                onPressed: _saveAndContinue,
-                style: FilledButton.styleFrom(
-                  backgroundColor: colors.primary,
-                  foregroundColor: colors.onPrimary,
-                  minimumSize: const Size(200, 48),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                ),
-                child: Text(_selectedMode == 'manual' ? 'Continue (Manual)' : 'Continue (Auto)',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _ModeCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String description;
-  final bool selected;
-  final ColorScheme colors;
-  final Color textColor;
-  final VoidCallback onTap;
-
-  const _ModeCard({
-    required this.icon, required this.title, required this.description,
-    required this.selected, required this.colors, required this.textColor, required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        width: double.infinity,
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: selected ? colors.primary.withAlpha(20) : colors.onSurface.withAlpha(8),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: selected ? colors.primary : colors.onSurface.withAlpha(20),
-            width: selected ? 2 : 1,
-          ),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, color: selected ? colors.primary : colors.onSurface.withAlpha(120), size: 24),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: TextStyle(fontWeight: FontWeight.w600, color: textColor, fontSize: 15)),
-                  const SizedBox(height: 2),
-                  Text(description, style: TextStyle(fontSize: 12, color: textColor.withAlpha(120))),
-                ],
-              ),
-            ),
-            if (selected)
-              Icon(Icons.check_circle, color: colors.primary, size: 22),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _FinishPage extends StatelessWidget {
-  final VoidCallback onStart;
-
-  const _FinishPage({required this.onStart});
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final textColor = colors.onSurface;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [colors.primary.withAlpha(60), colors.primary.withAlpha(20)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(24),
-                  border: Border.all(color: colors.primary.withAlpha(40)),
-                ),
-                child: Icon(Icons.lock_outline, size: 40, color: colors.primary),
-              ),
-              const SizedBox(height: 32),
-              Text(
-                'Secure Your Vault',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: textColor,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Your financial data will be encrypted with a PIN.\n'
-                'This PIN is the only way to unlock your vault.\n'
-                'There is no password recovery — keep it safe.',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: textColor.withAlpha(150),
-                  height: 1.5,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 8),
-              Container(
-                margin: const EdgeInsets.symmetric(vertical: 8),
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: Colors.amber.withAlpha(20),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.amber.withAlpha(40)),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.warning_amber_rounded, size: 20, color: Colors.amber.shade700),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Write down your PIN. If you forget it,\nyour data cannot be recovered.',
-                        style: TextStyle(color: Colors.amber.shade700, fontSize: 12, height: 1.4),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 32),
-              FilledButton.icon(
-                onPressed: onStart,
-                icon: const Icon(Icons.lock_open),
-                label: const Text('Set Up PIN'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: colors.primary,
-                  foregroundColor: colors.onPrimary,
-                  minimumSize: const Size(220, 54),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _BiometricsPage extends StatefulWidget {
-  final VoidCallback onNext;
-
-  const _BiometricsPage({required this.onNext});
-
-  @override
-  State<_BiometricsPage> createState() => _BiometricsPageState();
-}
-
-class _BiometricsPageState extends State<_BiometricsPage> {
-  bool _biometricEnabled = true;
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final auth = context.read<AuthService>();
-    final enabled = await auth.getBiometricUserEnabled();
-    if (mounted) setState(() { _biometricEnabled = enabled; _loading = false; });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final textColor = colors.onSurface;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  color: colors.primary.withAlpha(20),
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: Icon(Icons.fingerprint, size: 40, color: colors.primary),
-              ),
-              const SizedBox(height: 32),
-              Text(
-                'Biometric Unlock',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Use your fingerprint to quickly unlock\nthe app without entering your PIN.',
-                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.5),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-                decoration: BoxDecoration(
-                  color: colors.primary.withAlpha(10),
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.fingerprint, color: _biometricEnabled ? colors.primary : colors.onSurface.withAlpha(60)),
-                    const SizedBox(width: 12),
-                    Text('Fingerprint unlock', style: TextStyle(color: textColor, fontSize: 15)),
-                    const SizedBox(width: 12),
-                    _loading
-                        ? SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: colors.primary))
-                        : Switch(
-                            value: _biometricEnabled,
-                            activeColor: colors.primary,
-                            onChanged: (v) async {
-                              setState(() => _biometricEnabled = v);
-                              await context.read<AuthService>().setBiometricUserEnabled(v);
-                            },
-                          ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Your fingerprint data never leaves your device.\n'
-                'You can change this anytime in Security settings.',
-                style: TextStyle(fontSize: 12, color: textColor.withAlpha(100), height: 1.4),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              FilledButton(
-                onPressed: widget.onNext,
-                style: FilledButton.styleFrom(
-                  backgroundColor: colors.primary,
-                  foregroundColor: colors.onPrimary,
-                  minimumSize: const Size(200, 54),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                ),
-                child: const Text('Continue', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
+// ---------------------------------------------------------------------------
+// 6. Payday Setup — Yes/No + frequency + amount
+// ---------------------------------------------------------------------------
 
 class _PaydaySetupPage extends StatefulWidget {
   final VoidCallback onNext;
@@ -893,25 +989,45 @@ class _PaydaySetupPage extends StatefulWidget {
 }
 
 class _PaydaySetupPageState extends State<_PaydaySetupPage> {
+  bool _hasPayday = false;
   final _amountCtl = TextEditingController();
   String _frequency = 'weekly';
   int _weekday = DateTime.monday;
   int _monthDay = 1;
   final _noteCtl = TextEditingController();
+  final _customScheduleCtl = TextEditingController();
 
   @override
   void dispose() {
     _amountCtl.dispose();
     _noteCtl.dispose();
+    _customScheduleCtl.dispose();
     super.dispose();
+  }
+
+  Future<void> _save() async {
+    FocusScope.of(context).unfocus();
+    if (_hasPayday) {
+      final amount = double.tryParse(_amountCtl.text);
+      if (amount != null && amount > 0) {
+        final prefs = await SharedPreferences.getInstance();
+        if (_frequency == 'custom') {
+          final data = '$amount|custom|0|${_customScheduleCtl.text}';
+          await prefs.setString('onboarding_payday_setup', data);
+        } else {
+          final day = (_frequency == 'weekly' || _frequency == 'fortnightly') ? _weekday : _monthDay;
+          final data = '$amount|$_frequency|$day|${_noteCtl.text}';
+          await prefs.setString('onboarding_payday_setup', data);
+        }
+      }
+    }
+    widget.onNext();
   }
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final textColor = colors.onSurface;
-    final themeProvider = context.watch<ThemeProvider>();
-    final iconColor = themeProvider.cashIconAccent ? themeProvider.accentColor : colors.onSurface.withAlpha(120);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -921,148 +1037,144 @@ class _PaydaySetupPageState extends State<_PaydaySetupPage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 80,
-                height: 80,
+                width: 80, height: 80,
                 decoration: BoxDecoration(
-                  color: iconColor.withAlpha(25),
+                  color: colors.primary.withAlpha(20),
                   borderRadius: BorderRadius.circular(24),
                 ),
-                child: Icon(Icons.payments_outlined, size: 40, color: iconColor),
+                child: Icon(Icons.payments_outlined, size: 40, color: colors.primary),
               ),
               const SizedBox(height: 32),
-              Text(
-                'Set Up Your Pay',
+              Text(AppStrings.paydayTitle,
                 style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Optionally add a recurring paycheck.\nYou can configure this later in Settings.',
-                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 24),
-              Container(
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: colors.primary.withAlpha(8),
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Column(
-                  children: [
-                    TextField(
-                      controller: _amountCtl,
-                      style: TextStyle(color: textColor, fontSize: 28, fontWeight: FontWeight.bold),
-                      textAlign: TextAlign.center,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: InputDecoration(
-                        hintText: '0.00',
-                        hintStyle: TextStyle(color: textColor.withAlpha(60), fontSize: 28),
-                        filled: true,
-                        fillColor: colors.surface,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
-                        contentPadding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  _ChoiceChip(label: AppStrings.paydayYes, selected: _hasPayday, onTap: () => setState(() => _hasPayday = true), colors: colors, textColor: textColor),
+                  const SizedBox(width: 12),
+                  _ChoiceChip(label: AppStrings.paydayNo, selected: !_hasPayday, onTap: () => setState(() => _hasPayday = false), colors: colors, textColor: textColor),
+                ],
+              ),
+              if (_hasPayday) ...[
+                const SizedBox(height: 24),
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: colors.primary.withAlpha(8),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    children: [
+                      TextField(
+                        controller: _amountCtl,
+                        style: TextStyle(color: textColor, fontSize: 28, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                        decoration: InputDecoration(
+                          hintText: AppStrings.paydayAmountHint,
+                          hintStyle: TextStyle(color: textColor.withAlpha(60), fontSize: 28),
+                          filled: true, fillColor: colors.surface,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                          contentPadding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 16),
-                    DropdownButtonFormField<String>(
-                      value: _frequency,
-                      style: TextStyle(color: textColor),
-                      decoration: InputDecoration(
-                        labelText: 'Frequency',
-                        labelStyle: TextStyle(color: textColor.withAlpha(120)),
-                        filled: true,
-                        fillColor: colors.surface,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
-                        contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 'weekly', child: Text('Weekly')),
-                        DropdownMenuItem(value: 'fortnightly', child: Text('Fortnightly')),
-                        DropdownMenuItem(value: 'monthly', child: Text('Monthly')),
-                      ],
-                      onChanged: (v) => setState(() => _frequency = v!),
-                    ),
-                    const SizedBox(height: 12),
-                    if (_frequency == 'weekly' || _frequency == 'fortnightly')
-                      DropdownButtonFormField<int>(
-                        value: _weekday.clamp(1, 7),
+                      const SizedBox(height: 16),
+                      DropdownButtonFormField<String>(
+                        value: _frequency,
                         style: TextStyle(color: textColor),
                         decoration: InputDecoration(
-                          labelText: 'Day of Week',
+                          labelText: AppStrings.paydayFrequency,
                           labelStyle: TextStyle(color: textColor.withAlpha(120)),
-                          filled: true,
-                          fillColor: colors.surface,
+                          filled: true, fillColor: colors.surface,
                           border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
                           contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
                         ),
                         items: const [
-                          DropdownMenuItem(value: 1, child: Text('Monday')),
-                          DropdownMenuItem(value: 2, child: Text('Tuesday')),
-                          DropdownMenuItem(value: 3, child: Text('Wednesday')),
-                          DropdownMenuItem(value: 4, child: Text('Thursday')),
-                          DropdownMenuItem(value: 5, child: Text('Friday')),
-                          DropdownMenuItem(value: 6, child: Text('Saturday')),
-                          DropdownMenuItem(value: 7, child: Text('Sunday')),
+                          DropdownMenuItem(value: 'weekly', child: Text(AppStrings.paydayWeekly)),
+                          DropdownMenuItem(value: 'fortnightly', child: Text(AppStrings.paydayFortnightly)),
+                          DropdownMenuItem(value: 'monthly', child: Text(AppStrings.paydayMonthly)),
+                          DropdownMenuItem(value: 'custom', child: Text(AppStrings.paydayCustom)),
                         ],
-                        onChanged: (v) => setState(() => _weekday = v!),
+                        onChanged: (v) => setState(() => _frequency = v!),
                       ),
-                    if (_frequency == 'monthly')
-                      DropdownButtonFormField<int>(
-                        value: _monthDay.clamp(1, 28),
+                      const SizedBox(height: 12),
+                      if (_frequency == 'weekly' || _frequency == 'fortnightly')
+                        DropdownButtonFormField<int>(
+                          value: _weekday.clamp(1, 7),
+                          style: TextStyle(color: textColor),
+                          decoration: InputDecoration(
+                            labelText: AppStrings.paydayDayOfWeek,
+                            labelStyle: TextStyle(color: textColor.withAlpha(120)),
+                            filled: true, fillColor: colors.surface,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                            contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                          ),
+                          items: const [
+                            DropdownMenuItem(value: 1, child: Text('Monday')),
+                            DropdownMenuItem(value: 2, child: Text('Tuesday')),
+                            DropdownMenuItem(value: 3, child: Text('Wednesday')),
+                            DropdownMenuItem(value: 4, child: Text('Thursday')),
+                            DropdownMenuItem(value: 5, child: Text('Friday')),
+                            DropdownMenuItem(value: 6, child: Text('Saturday')),
+                            DropdownMenuItem(value: 7, child: Text('Sunday')),
+                          ],
+                          onChanged: (v) => setState(() => _weekday = v!),
+                        ),
+                      if (_frequency == 'monthly')
+                        DropdownButtonFormField<int>(
+                          value: _monthDay.clamp(1, 28),
+                          style: TextStyle(color: textColor),
+                          decoration: InputDecoration(
+                            labelText: AppStrings.paydayDayOfMonth,
+                            labelStyle: TextStyle(color: textColor.withAlpha(120)),
+                            filled: true, fillColor: colors.surface,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                            contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                          ),
+                          items: List.generate(28, (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}'))),
+                          onChanged: (v) => setState(() => _monthDay = v!),
+                        ),
+                      if (_frequency == 'custom')
+                        TextField(
+                          controller: _customScheduleCtl,
+                          style: TextStyle(color: textColor),
+                          decoration: InputDecoration(
+                            hintText: AppStrings.paydayCustomHint,
+                            hintStyle: TextStyle(color: textColor.withAlpha(80)),
+                            filled: true, fillColor: colors.surface,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                            contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _noteCtl,
                         style: TextStyle(color: textColor),
                         decoration: InputDecoration(
-                          labelText: 'Day of Month',
-                          labelStyle: TextStyle(color: textColor.withAlpha(120)),
-                          filled: true,
-                          fillColor: colors.surface,
+                          hintText: AppStrings.paydayNoteHint,
+                          hintStyle: TextStyle(color: textColor.withAlpha(80)),
+                          filled: true, fillColor: colors.surface,
                           border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
                           contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
                         ),
-                        items: List.generate(28, (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}'))),
-                        onChanged: (v) => setState(() => _monthDay = v!),
                       ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _noteCtl,
-                      style: TextStyle(color: textColor),
-                      decoration: InputDecoration(
-                        hintText: 'Paycheck note (optional)',
-                        hintStyle: TextStyle(color: textColor.withAlpha(80)),
-                        filled: true,
-                        fillColor: colors.surface,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
-                        contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
+              ],
               const SizedBox(height: 24),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  OutlinedButton(
-                    onPressed: () => _saveAndContinue(skip: true),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: colors.onSurface.withAlpha(120),
-                      side: BorderSide(color: colors.onSurface.withAlpha(30)),
-                      minimumSize: const Size(120, 48),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    child: const Text('Skip'),
-                  ),
-                  const SizedBox(width: 16),
-                  FilledButton(
-                    onPressed: () => _saveAndContinue(skip: false),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: colors.primary,
-                      foregroundColor: colors.onPrimary,
-                      minimumSize: const Size(160, 48),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    child: const Text('Save & Continue', style: TextStyle(fontWeight: FontWeight.w600)),
-                  ),
-                ],
+              FilledButton(
+                onPressed: _save,
+                style: FilledButton.styleFrom(
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: const Text(AppStrings.paydayCta, style: TextStyle(fontWeight: FontWeight.w600)),
               ),
             ],
           ),
@@ -1070,21 +1182,50 @@ class _PaydaySetupPageState extends State<_PaydaySetupPage> {
       ),
     );
   }
+}
 
-  Future<void> _saveAndContinue({required bool skip}) async {
-    if (!skip) {
-      final amount = double.tryParse(_amountCtl.text);
-      if (amount != null && amount > 0) {
-        final day = (_frequency == 'weekly' || _frequency == 'fortnightly') ? _weekday : _monthDay;
-        final data = '$amount|$_frequency|$day|${_noteCtl.text}';
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('onboarding_payday_setup', data);
-        if (kDebugMode) debugPrint('[Onboarding] Saved pending payday: $data');
-      }
-    }
-    widget.onNext();
+class _ChoiceChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final ColorScheme colors;
+  final Color textColor;
+
+  const _ChoiceChip({
+    required this.label, required this.selected, required this.onTap,
+    required this.colors, required this.textColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+        decoration: BoxDecoration(
+          color: selected ? colors.primary.withAlpha(20) : colors.onSurface.withAlpha(8),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: selected ? colors.primary : colors.onSurface.withAlpha(20),
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Text(label,
+          style: TextStyle(
+            color: selected ? colors.primary : textColor.withAlpha(150),
+            fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+            fontSize: 15,
+          ),
+        ),
+      ),
+    );
   }
 }
+
+// ---------------------------------------------------------------------------
+// 7. Starting Balance
+// ---------------------------------------------------------------------------
 
 class _StartingBalancePage extends StatefulWidget {
   final VoidCallback onNext;
@@ -1105,6 +1246,7 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
   }
 
   Future<void> _save({required bool skip}) async {
+    FocusScope.of(context).unfocus();
     if (!skip) {
       final amount = double.tryParse(_amountCtl.text);
       if (amount != null && amount > 0) {
@@ -1119,8 +1261,6 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final textColor = colors.onSurface;
-    final themeProvider = context.watch<ThemeProvider>();
-    final iconColor = themeProvider.cashIconAccent ? themeProvider.accentColor : colors.onSurface.withAlpha(120);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -1132,19 +1272,16 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
               Container(
                 width: 80, height: 80,
                 decoration: BoxDecoration(
-                  color: iconColor.withAlpha(25),
+                  color: colors.primary.withAlpha(20),
                   borderRadius: BorderRadius.circular(24),
                 ),
-                child: Icon(Icons.account_balance_wallet, size: 40, color: iconColor),
+                child: Icon(Icons.account_balance_wallet, size: 40, color: colors.primary),
               ),
               const SizedBox(height: 32),
-              Text(
-                'Starting Balance',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor),
-              ),
+              Text(AppStrings.balanceTitle,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
               const SizedBox(height: 8),
-              Text(
-                'Enter the money you already have,\nor start fresh with \$0.',
+              Text(AppStrings.balanceSubtitle,
                 style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
                 textAlign: TextAlign.center,
               ),
@@ -1161,18 +1298,16 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
                   textAlign: TextAlign.center,
                   keyboardType: const TextInputType.numberWithOptions(decimal: true),
                   decoration: InputDecoration(
-                    hintText: '0.00',
+                    hintText: AppStrings.balanceHint,
                     hintStyle: TextStyle(color: textColor.withAlpha(60), fontSize: 28),
-                    filled: true,
-                    fillColor: colors.surface,
+                    filled: true, fillColor: colors.surface,
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
                     contentPadding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
                   ),
                 ),
               ),
               const SizedBox(height: 8),
-              Text(
-                'This is added once as your opening balance.\nYou can always add more after setup.',
+              Text(AppStrings.balanceFooter,
                 style: TextStyle(fontSize: 11, color: textColor.withAlpha(100), height: 1.4),
                 textAlign: TextAlign.center,
               ),
@@ -1188,7 +1323,7 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
                       minimumSize: const Size(120, 48),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                     ),
-                    child: const Text('Start Fresh'),
+                    child: const Text(AppStrings.balanceSkip),
                   ),
                   const SizedBox(width: 16),
                   FilledButton(
@@ -1199,7 +1334,7 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
                       minimumSize: const Size(160, 48),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                     ),
-                    child: const Text('Set Balance', style: TextStyle(fontWeight: FontWeight.w600)),
+                    child: const Text(AppStrings.balanceSet, style: TextStyle(fontWeight: FontWeight.w600)),
                   ),
                 ],
               ),
@@ -1209,4 +1344,381 @@ class _StartingBalancePageState extends State<_StartingBalancePage> {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Envelope Setup — Create own / Recommended
+// ---------------------------------------------------------------------------
+
+class _EnvelopeSetupPage extends StatefulWidget {
+  final VoidCallback onNext;
+  const _EnvelopeSetupPage({required this.onNext});
+
+  @override
+  State<_EnvelopeSetupPage> createState() => _EnvelopeSetupPageState();
+}
+
+class _EnvelopeSetupPageState extends State<_EnvelopeSetupPage> {
+  bool _useRecommended = true;
+  String _selectedTemplate = 'basic';
+  String _customNames = '';
+
+  static const _templates = [
+    ('basic', AppStrings.envelopeTemplateBasic, ['Groceries', 'Bills', 'Transport', 'Savings', 'Fun']),
+    ('student', AppStrings.envelopeTemplateStudent, ['Food', 'Transport', 'Study', 'Savings', 'Entertainment']),
+    ('minimal', AppStrings.envelopeTemplateMinimal, ['Essentials', 'Bills', 'Savings']),
+  ];
+
+  Future<void> _save() async {
+    FocusScope.of(context).unfocus();
+    final prefs = await SharedPreferences.getInstance();
+    if (_useRecommended) {
+      final template = _templates.firstWhere((t) => t.$1 == _selectedTemplate);
+      await prefs.setString('onboarding_envelopes', template.$3.join(','));
+      await prefs.setString('onboarding_envelope_template', _selectedTemplate);
+    } else {
+      if (_customNames.trim().isNotEmpty) {
+        await prefs.setString('onboarding_envelopes', _customNames);
+      }
+    }
+    widget.onNext();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final textColor = colors.onSurface;
+    final template = _templates.firstWhere((t) => t.$1 == _selectedTemplate);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Center(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 80, height: 80,
+                decoration: BoxDecoration(
+                  color: colors.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Icon(Icons.folder_outlined, size: 40, color: colors.primary),
+              ),
+              const SizedBox(height: 32),
+              Text(AppStrings.envelopeTitle,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: textColor)),
+              const SizedBox(height: 8),
+              Text(AppStrings.envelopeSubtitle,
+                style: TextStyle(fontSize: 14, color: textColor.withAlpha(150), height: 1.4),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 24),
+              _ChoiceChip(label: AppStrings.envelopeRecommended, selected: _useRecommended,
+                onTap: () => setState(() => _useRecommended = true), colors: colors, textColor: textColor),
+              const SizedBox(height: 8),
+              _ChoiceChip(label: AppStrings.envelopeCreateOwn, selected: !_useRecommended,
+                onTap: () => setState(() => _useRecommended = false), colors: colors, textColor: textColor),
+              if (_useRecommended) ...[
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: DropdownButtonFormField<String>(
+                    value: _selectedTemplate,
+                    style: TextStyle(color: textColor),
+                    decoration: InputDecoration(
+                      labelText: AppStrings.envelopeTemplateLabel,
+                      labelStyle: TextStyle(color: textColor.withAlpha(120)),
+                      filled: true, fillColor: colors.surface,
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                    ),
+                    items: _templates.map((t) =>
+                      DropdownMenuItem(value: t.$1, child: Text(t.$2))
+                    ).toList(),
+                    onChanged: (v) => setState(() => _selectedTemplate = v!),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: colors.primary.withAlpha(8),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(AppStrings.envelopeListTitle, style: TextStyle(color: textColor.withAlpha(150), fontSize: 12)),
+                      const SizedBox(height: 8),
+                      ...(template.$3.map((n) => Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Row(
+                          children: [
+                            Icon(Icons.check_circle_outline, size: 16, color: colors.primary),
+                            const SizedBox(width: 8),
+                            Text(n, style: TextStyle(color: textColor, fontSize: 14)),
+                            const Spacer(),
+                            Text('\$0', style: TextStyle(color: textColor.withAlpha(100), fontSize: 12)),
+                          ],
+                        ),
+                      ))),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(AppStrings.envelopeZeroFooter,
+                  style: TextStyle(fontSize: 11, color: textColor.withAlpha(100), height: 1.4),
+                  textAlign: TextAlign.center,
+                ),
+              ] else ...[
+                const SizedBox(height: 16),
+                TextField(
+                  maxLines: 3,
+                  controller: TextEditingController()..text = _customNames,
+                  onChanged: (v) => _customNames = v,
+                  style: TextStyle(color: textColor),
+                  decoration: InputDecoration(
+                    hintText: AppStrings.envelopeCustomHint,
+                    hintStyle: TextStyle(color: textColor.withAlpha(80)),
+                    filled: true, fillColor: colors.surface,
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: _save,
+                style: FilledButton.styleFrom(
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: Text(_useRecommended ? AppStrings.envelopeCtaRecommended : AppStrings.envelopeCtaSkip,
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Finish — with built-in tutorial cards
+// ---------------------------------------------------------------------------
+
+class _FinishPage extends StatefulWidget {
+  final void Function({bool tutorial}) onFinish;
+
+  const _FinishPage({required this.onFinish});
+
+  @override
+  State<_FinishPage> createState() => _FinishPageState();
+}
+
+class _FinishPageState extends State<_FinishPage> {
+  int _step = 0;
+
+  static const _cards = [
+    _TutorialCardData(
+      icon: Icons.account_balance_wallet_outlined,
+      title: AppStrings.tutorialStep0Title,
+      description: AppStrings.tutorialStep0Body,
+    ),
+    _TutorialCardData(
+      icon: Icons.auto_awesome_mosaic_outlined,
+      title: AppStrings.tutorialStep1Title,
+      description: AppStrings.tutorialStep1Body,
+    ),
+    _TutorialCardData(
+      icon: Icons.add_circle_outline,
+      title: AppStrings.tutorialStep2Title,
+      description: AppStrings.tutorialStep2Body,
+    ),
+  ];
+
+  void _next() {
+    if (_step < _cards.length - 1) {
+      setState(() => _step++);
+    } else {
+      widget.onFinish(tutorial: false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final card = _cards[_step];
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Center(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 80, height: 80,
+                decoration: BoxDecoration(
+                  color: colors.primary.withAlpha(20),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Icon(card.icon, size: 40, color: colors.primary),
+              ),
+              const SizedBox(height: 32),
+              Text(card.title,
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: colors.onSurface)),
+              const SizedBox(height: 12),
+              Text(card.description,
+                style: TextStyle(fontSize: 15, color: colors.onSurface.withAlpha(150), height: 1.5),
+                textAlign: TextAlign.center),
+              const SizedBox(height: 32),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(_cards.length, (i) {
+                  return Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: i == _step ? 20 : 8, height: 8,
+                    decoration: BoxDecoration(
+                      color: i == _step ? colors.primary : colors.onSurface.withAlpha(40),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  );
+                }),
+              ),
+              const SizedBox(height: 24),
+              FilledButton(
+                onPressed: _next,
+                style: FilledButton.styleFrom(
+                  backgroundColor: colors.primary,
+                  foregroundColor: colors.onPrimary,
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: Text(_step < _cards.length - 1 ? 'Next' : 'Go to Dashboard',
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tutorial screen — shown after tapping "Quick Tutorial" on Finish page
+// ---------------------------------------------------------------------------
+
+class _TutorialScreen extends StatefulWidget {
+  const _TutorialScreen();
+
+  @override
+  State<_TutorialScreen> createState() => _TutorialScreenState();
+}
+
+class _TutorialScreenState extends State<_TutorialScreen> {
+  int _step = 0;
+
+  void _next() {
+    if (_step < 2) {
+      setState(() => _step++);
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        Navigator.pushReplacementNamed(context, '/');
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final cards = [
+      _TutorialCardData(
+        icon: Icons.account_balance_wallet_outlined,
+        title: AppStrings.tutorialStep0Title,
+        description: AppStrings.tutorialStep0Body,
+      ),
+      _TutorialCardData(
+        icon: Icons.auto_awesome_mosaic_outlined,
+        title: AppStrings.tutorialStep1Title,
+        description: AppStrings.tutorialStep1Body,
+      ),
+      _TutorialCardData(
+        icon: Icons.add_circle_outline,
+        title: AppStrings.tutorialStep2Title,
+        description: AppStrings.tutorialStep2Body,
+      ),
+    ];
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 80, height: 80,
+                  decoration: BoxDecoration(
+                    color: colors.primary.withAlpha(20),
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                  child: Icon(cards[_step].icon, size: 40, color: colors.primary),
+                ),
+                const SizedBox(height: 32),
+                Text(cards[_step].title,
+                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: colors.onSurface)),
+                const SizedBox(height: 12),
+                Text(cards[_step].description,
+                  style: TextStyle(fontSize: 15, color: colors.onSurface.withAlpha(150), height: 1.5),
+                  textAlign: TextAlign.center),
+                const SizedBox(height: 32),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: List.generate(cards.length, (i) {
+                    return Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      width: i == _step ? 20 : 8, height: 8,
+                      decoration: BoxDecoration(
+                        color: i == _step ? colors.primary : colors.onSurface.withAlpha(40),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    );
+                  }),
+                ),
+                const SizedBox(height: 24),
+                FilledButton(
+                  onPressed: _next,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: colors.primary,
+                    foregroundColor: colors.onPrimary,
+                    minimumSize: const Size(200, 48),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ),
+                  child: Text(_step < 2 ? AppStrings.tutorialNext : AppStrings.tutorialFinish,
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TutorialCardData {
+  final IconData icon;
+  final String title;
+  final String description;
+  const _TutorialCardData({required this.icon, required this.title, required this.description});
 }

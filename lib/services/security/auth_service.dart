@@ -477,10 +477,16 @@ class AuthService extends ChangeNotifier {
   /// pending flag.  Called after vault creation in PinScreen.
   static const _pendingPaydayKey = 'onboarding_payday_setup';
 
+  bool _importedPendingPayday = false;
+
   Future<void> importPendingOnboardingPayday() async {
+    if (_importedPendingPayday) return;
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_pendingPaydayKey);
-    if (raw == null || raw.isEmpty) return;
+    if (raw == null || raw.isEmpty) { _importedPendingPayday = true; return; }
+    if (!dbHelper.isOpen) return;
+    await prefs.remove(_pendingPaydayKey);
+    _importedPendingPayday = true;
     try {
       final data = raw.split('|');
       if (data.length < 2) return;
@@ -490,7 +496,6 @@ class AuthService extends ChangeNotifier {
       final weekday = frequency == 'weekly' ? int.tryParse(data[2]) : null;
       final monthDay = frequency == 'monthly' ? int.tryParse(data[2]) : null;
       final note = data.length > 3 ? data[3] : '';
-      if (!dbHelper.isOpen) return;
       final todayStr = DateTime.now().toIso8601String().substring(0, 10);
       final rule = RecurringPayday(
         amount: amount,
@@ -504,17 +509,21 @@ class AuthService extends ChangeNotifier {
       await dbHelper.insertRecurringPayday(rule);
       if (kDebugMode) debugPrint('[Auth] Imported pending onboarding payday: $amount $frequency');
     } catch (_) {}
-    await prefs.remove(_pendingPaydayKey);
   }
 
   static const _startingBalanceKey = 'onboarding_starting_balance';
 
+  bool _importedStartingBalance = false;
+
   Future<void> importStartingBalance() async {
+    if (_importedStartingBalance) return;
     final prefs = await SharedPreferences.getInstance();
     final amount = prefs.getDouble(_startingBalanceKey);
-    if (amount == null || amount <= 0) return;
+    if (amount == null || amount <= 0) { _importedStartingBalance = true; return; }
+    if (!dbHelper.isOpen) return;
+    await prefs.remove(_startingBalanceKey);
+    _importedStartingBalance = true;
     try {
-      if (!dbHelper.isOpen) return;
       final payday = Payday(
         amount: amount,
         note: 'Starting Balance',
@@ -523,7 +532,6 @@ class AuthService extends ChangeNotifier {
       await dbHelper.insertPayday(payday);
       if (kDebugMode) debugPrint('[Auth] Imported starting balance: $amount');
     } catch (_) {}
-    await prefs.remove(_startingBalanceKey);
   }
 
   void setAuthenticated(bool value) {

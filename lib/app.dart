@@ -8,11 +8,15 @@ import 'screens/envelope_detail_screen.dart';
 import 'screens/add_transaction_screen.dart';
 import 'screens/pin_screen.dart';
 import 'screens/onboarding_screen.dart';
+import 'screens/expired_screen.dart';
 import 'screens/payday_allocation_screen.dart';
 import 'screens/alloc_percentages_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/security_screen.dart';
 import 'services/security/auth_service.dart';
+import 'services/security/build_gate_service.dart';
+import 'services/security/trial_gate_service.dart';
+import 'widgets/hidden_unlock_detector.dart';
 
 class CoinDropApp extends StatelessWidget {
   const CoinDropApp({super.key});
@@ -30,9 +34,13 @@ class CoinDropApp extends StatelessWidget {
           themeMode: themeProvider.themeMode,
           theme: _buildTheme(accent, Brightness.light),
           darkTheme: _buildTheme(accent, Brightness.dark),
-          home: const _AuthGateWidget(),
+          home: const _AppGateWidget(),
           onGenerateRoute: _onGenerateRoute,
         );
+
+        // Wrap in hidden unlock detector so the 7-tap sequence works
+        // even when the app is in expiredLocked state.
+        app = HiddenUnlockDetector(child: app);
 
         // Provide EnvelopeProvider above the Navigator so all routes
         // (including pushNamed routes like /settings) can access it.
@@ -53,7 +61,7 @@ class CoinDropApp extends StatelessWidget {
 
     switch (settings.name) {
       case '/':
-        page = const _AuthGateWidget();
+        page = const _AppGateWidget();
         break;
       case '/add-envelope':
         page = const AddEnvelopeScreen();
@@ -77,7 +85,7 @@ class CoinDropApp extends StatelessWidget {
         page = const SecurityScreen();
         break;
       default:
-        page = const _AuthGateWidget();
+        page = const _AppGateWidget();
     }
 
     return _buildPageRoute(page, settings);
@@ -246,22 +254,35 @@ class CoinDropApp extends StatelessWidget {
   }
 }
 
-class _AuthGateWidget extends StatefulWidget {
-  const _AuthGateWidget();
+class _AppGateWidget extends StatefulWidget {
+  const _AppGateWidget();
 
   @override
-  State<_AuthGateWidget> createState() => _AuthGateWidgetState();
+  State<_AppGateWidget> createState() => _AppGateWidgetState();
 }
 
-class _AuthGateWidgetState extends State<_AuthGateWidget> {
+class _AppGateWidgetState extends State<_AppGateWidget> {
   bool _attemptedBiometric = false;
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AuthService>(
-      builder: (context, auth, _) {
-        if (!auth.initialized) {
+    return Consumer3<AuthService, BuildGateService, TrialGateService>(
+      builder: (context, auth, gate, trial, _) {
+        if (!auth.initialized || !gate.initialized || !trial.initialized) {
           return const _SplashScreen();
+        }
+        // Build gate check: expired and not unlocked
+        if (gate.state == AppLockState.expiredLocked) {
+          return const ExpiredScreen();
+        }
+        // Trial gate check: expired and not unlocked
+        if (trial.state == TrialState.expired) {
+          return ExpiredScreen(
+            title: 'Your 7-day trial has ended',
+            message: 'Export your data or enter a license code to continue',
+            showUnlockField: true,
+            onUnlock: (code) => context.read<TrialGateService>().attemptUnlock(code),
+          );
         }
         if (!auth.hasVault) {
           return const OnboardingScreen();

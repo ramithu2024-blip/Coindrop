@@ -5,12 +5,13 @@ import 'package:provider/provider.dart';
 import '../widgets/pin_input_widget.dart';
 import '../services/security/auth_service.dart';
 
-enum PinMode { setup, unlock }
+enum PinMode { setup, confirm, unlock, change }
 
 class PinScreen extends StatefulWidget {
   final PinMode mode;
+  final void Function(bool success)? onResult;
 
-  const PinScreen({super.key, required this.mode});
+  const PinScreen({super.key, required this.mode, this.onResult});
 
   @override
   State<PinScreen> createState() => _PinScreenState();
@@ -38,6 +39,8 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
   int _lockoutRemaining = 0;
   Timer? _lockoutTimer;
   bool _vaultWiped = false;
+
+  String? _currentPin;
 
   @override
   void initState() {
@@ -71,6 +74,11 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
       if (mounted) _checkState();
     });
   }
+
+  bool get _isUnlock => widget.mode == PinMode.unlock;
+  bool get _isChange => widget.mode == PinMode.change;
+  bool get _isSetup => widget.mode == PinMode.setup || widget.mode == PinMode.confirm;
+  bool get _needsCurrentPin => _isChange;
 
   void _onPinChanged() {
     setState(() => _pinLength = _pinController.text.length);
@@ -142,218 +150,306 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
     _shakeController.forward(from: 0);
   }
 
+  bool _allDigits(String s) => RegExp(r'^\d+$').hasMatch(s);
+
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final isLock = widget.mode == PinMode.unlock;
+
+    String title;
+    String subtitle;
+    IconData iconData;
+
+    if (_isUnlock) {
+      title = 'Vault Locked';
+      subtitle = 'Enter your PIN to access your vault';
+      iconData = _error ? Icons.lock_outline : Icons.lock;
+    } else if (_isChange && _currentPin == null) {
+      title = 'Verify Current PIN';
+      subtitle = 'Enter your current PIN to continue';
+      iconData = Icons.lock_outline;
+    } else if (_isChange && _showConfirm) {
+      title = 'Confirm New PIN';
+      subtitle = 'Re-enter your new PIN';
+      iconData = Icons.lock_outline;
+    } else if (_isChange) {
+      title = 'Change PIN';
+      subtitle = 'Enter a new 4-digit PIN';
+      iconData = Icons.lock_open;
+    } else if (_showConfirm) {
+      title = 'Confirm PIN';
+      subtitle = 'Re-enter your PIN to confirm';
+      iconData = Icons.lock_outline;
+    } else {
+      title = 'Set Vault PIN';
+      subtitle = 'Create a 4-digit PIN to protect your vault';
+      iconData = Icons.lock_open;
+    }
 
     return Scaffold(
       backgroundColor: colors.surface,
-      body: Stack(
-        children: [
-          Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const SizedBox(height: 40),
+      body: PopScope(
+        canPop: !_isSetup && !_isChange,
+        onPopInvokedWithResult: (didPop, _) {
+          if (didPop) return;
+          if (_showConfirm) {
+            setState(() {
+              _showConfirm = false;
+              _error = false;
+            });
+          } else if (_isChange && _currentPin != null) {
+            setState(() {
+              _currentPin = null;
+              _error = false;
+              _pinController.clear();
+            });
+          } else {
+            Navigator.maybePop(context);
+          }
+        },
+        child: Stack(
+          children: [
+            Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(height: 40),
 
-                  if (_vaultWiped)
-                    _buildWipeContent(colors)
-                  else ...[
-                    AnimatedBuilder(
-                    animation: _pulseAnimation,
-                    builder: (context, child) {
-                      return Transform.scale(
-                        scale: _pulseAnimation.value,
-                        child: child,
-                      );
-                    },
-                    child: Container(
-                      width: 80, height: 80,
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            colors.primary.withAlpha(40),
-                            colors.primary.withAlpha(15),
-                          ],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
+                    if (_vaultWiped)
+                      _buildWipeContent(colors)
+                    else ...[
+                      AnimatedBuilder(
+                      animation: _pulseAnimation,
+                      builder: (context, child) {
+                        return Transform.scale(
+                          scale: _pulseAnimation.value,
+                          child: child,
+                        );
+                      },
+                      child: Container(
+                        width: 80, height: 80,
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [
+                              colors.primary.withAlpha(40),
+                              colors.primary.withAlpha(15),
+                            ],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: colors.primary.withAlpha(30),
+                            width: 1.5,
+                          ),
                         ),
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(
-                          color: colors.primary.withAlpha(30),
-                          width: 1.5,
+                        child: Icon(
+                          iconData,
+                          size: 38,
+                          color: _error ? colors.error : colors.primary,
                         ),
-                      ),
-                      child: Icon(
-                        isLock
-                            ? (_error ? Icons.lock_outline : Icons.lock)
-                            : (_showConfirm ? Icons.lock_outline : Icons.lock_open),
-                        size: 38,
-                        color: _error ? colors.error : colors.primary,
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 28),
-                  Text(
-                    isLock ? 'Vault Locked' : (_showConfirm ? 'Confirm PIN' : 'Set Vault PIN'),
-                    style: TextStyle(
-                      color: colors.onSurface,
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    isLock
-                        ? 'Enter your PIN to access your vault'
-                        : (_showConfirm ? 'Re-enter your PIN to confirm' : 'Create a 4-digit PIN to protect your vault'),
-                    style: TextStyle(color: colors.onSurface.withAlpha(120), fontSize: 14),
-                  ),
-
-                  // -- Lockout Countdown --
-                  if (_lockoutRemaining > 0 && isLock) ...[
-                    const SizedBox(height: 16),
-                    Container(
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: colors.error.withAlpha(20),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: colors.error.withAlpha(40)),
+                    const SizedBox(height: 28),
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: colors.onSurface,
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.5,
                       ),
-                      child: Row(
-                        children: [
-                          Icon(Icons.timer_off_outlined, size: 18, color: colors.error),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              'Too many failed attempts. Try again in ${_formatDuration(_lockoutRemaining)}.',
-                              style: TextStyle(color: colors.error, fontSize: 13),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      subtitle,
+                      style: TextStyle(color: colors.onSurface.withAlpha(120), fontSize: 14),
+                    ),
+
+                    if (_lockoutRemaining > 0 && _isUnlock) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: colors.error.withAlpha(20),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: colors.error.withAlpha(40)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.timer_off_outlined, size: 18, color: colors.error),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Too many failed attempts. Try again in ${_formatDuration(_lockoutRemaining)}.',
+                                style: TextStyle(color: colors.error, fontSize: 13),
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
 
-                  const SizedBox(height: 36),
-                  _buildPinRow(colors, _pinController, _pinFocus, _pinLength, false),
-                  if (_showConfirm && !isLock) ...[
-                    const SizedBox(height: 20),
-                    _buildPinRow(colors, _confirmController, _confirmFocus, _confirmLength, true),
-                  ],
-                  if (_error) ...[
-                    const SizedBox(height: 16),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                      decoration: BoxDecoration(
-                        color: colors.error.withAlpha(20),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: colors.error.withAlpha(40)),
+                    const SizedBox(height: 36),
+                    if (!_needsCurrentPin || _currentPin != null) ...[
+                      _buildPinRow(colors, _pinController, _pinFocus, _pinLength, false),
+                      if (_showConfirm) ...[
+                        const SizedBox(height: 20),
+                        _buildPinRow(colors, _confirmController, _confirmFocus, _confirmLength, true),
+                      ],
+                    ] else ...[
+                      _buildPinRow(colors, _pinController, _pinFocus, _pinLength, false),
+                    ],
+
+                    if (_error) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: colors.error.withAlpha(20),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: colors.error.withAlpha(40)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 18, color: colors.error),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(_errorMsg,
+                                style: TextStyle(color: colors.error, fontSize: 13)),
+                            ),
+                          ],
+                        ),
                       ),
-                      child: Row(
-                        children: [
-                          Icon(Icons.info_outline, size: 18, color: colors.error),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(_errorMsg,
-                              style: TextStyle(color: colors.error, fontSize: 13)),
+                    ],
+                    const SizedBox(height: 28),
+                    AnimatedBuilder(
+                      animation: _shakeAnimation,
+                      builder: (context, child) {
+                        final shake = _shakeAnimation.value;
+                        final offset = sin(shake * pi * 6) * 6;
+                        return Transform.translate(
+                          offset: Offset(offset, 0),
+                          child: child,
+                        );
+                      },
+                      child: SizedBox(
+                        width: double.infinity,
+                        height: 54,
+                        child: FilledButton(
+                          onPressed: (_loading || _isProcessing || _lockoutRemaining > 0)
+                              ? null
+                              : _handleAction,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: colors.primary,
+                            foregroundColor: colors.onPrimary,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                            elevation: 0,
                           ),
-                        ],
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 28),
-                  AnimatedBuilder(
-                    animation: _shakeAnimation,
-                    builder: (context, child) {
-                      final shake = _shakeAnimation.value;
-                      final offset = sin(shake * pi * 6) * 6;
-                      return Transform.translate(
-                        offset: Offset(offset, 0),
-                        child: child,
-                      );
-                    },
-                    child: SizedBox(
-                      width: double.infinity,
-                      height: 54,
-                      child: FilledButton(
-                        onPressed: (_loading || _isProcessing || _lockoutRemaining > 0)
-                            ? null
-                            : (isLock ? _verifyPin : _setupPin),
-                        style: FilledButton.styleFrom(
-                          backgroundColor: colors.primary,
-                          foregroundColor: colors.onPrimary,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                          elevation: 0,
-                        ),
-                        child: Text(
-                          isLock
-                              ? 'Unlock Vault'
-                              : (_showConfirm ? 'Confirm' : 'Continue'),
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                          child: Text(
+                            _buttonLabel(),
+                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  if (isLock && _biometricAvailable && _canUseBiometrics) ...[
-                    const SizedBox(height: 20),
-                    TextButton.icon(
-                      onPressed: (_lockoutRemaining > 0) ? null : _authenticateBiometric,
-                      icon: Icon(Icons.fingerprint, size: 22, color: colors.primary),
-                      label: Text(
-                        'Unlock with Fingerprint',
-                        style: TextStyle(color: colors.primary, fontSize: 15),
+                    if (_isUnlock && _biometricAvailable && _canUseBiometrics) ...[
+                      const SizedBox(height: 20),
+                      TextButton.icon(
+                        onPressed: (_lockoutRemaining > 0) ? null : _authenticateBiometric,
+                        icon: Icon(Icons.fingerprint, size: 22, color: colors.primary),
+                        label: Text(
+                          'Unlock with Fingerprint',
+                          style: TextStyle(color: colors.primary, fontSize: 15),
+                        ),
                       ),
-                    ),
+                    ],
+                    // Back button during multi-step flows
+                    if (!_isUnlock && (_showConfirm || (_isChange && _currentPin != null))) ...[
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: () {
+                          if (_showConfirm) {
+                            setState(() {
+                              _showConfirm = false;
+                              _error = false;
+                            });
+                          } else if (_isChange && _currentPin != null) {
+                            setState(() {
+                              _currentPin = null;
+                              _error = false;
+                              _pinController.clear();
+                            });
+                          }
+                        },
+                        child: Text('Back',
+                            style: TextStyle(color: colors.onSurface.withAlpha(120))),
+                      ),
+                    ],
                   ],
-                ],
-                const SizedBox(height: 40),
-                ],
+                  const SizedBox(height: 40),
+                  ],
+                ),
               ),
             ),
-          ),
-          if (_loading)
-            IgnorePointer(
-              child: Container(
-                color: colors.surface.withAlpha(230),
-                child: Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
-                    decoration: BoxDecoration(
-                      color: colors.surface,
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: colors.onSurface.withAlpha(20),
-                          blurRadius: 30,
-                          offset: const Offset(0, 10),
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(
-                          width: 36, height: 36,
-                          child: CircularProgressIndicator(strokeWidth: 3),
-                        ),
-                        const SizedBox(height: 20),
-                        Text(_loadingText,
-                          style: TextStyle(color: colors.onSurface, fontSize: 15)),
-                      ],
+            if (_loading)
+              IgnorePointer(
+                child: Container(
+                  color: colors.surface.withAlpha(230),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                      decoration: BoxDecoration(
+                        color: colors.surface,
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: [
+                          BoxShadow(
+                            color: colors.onSurface.withAlpha(20),
+                            blurRadius: 30,
+                            offset: const Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(
+                            width: 36, height: 36,
+                            child: CircularProgressIndicator(strokeWidth: 3),
+                          ),
+                          const SizedBox(height: 20),
+                          Text(_loadingText,
+                            style: TextStyle(color: colors.onSurface, fontSize: 15)),
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
+  }
+
+  String _buttonLabel() {
+    if (_isUnlock) return 'Unlock Vault';
+    if (_isChange && _currentPin == null) return 'Verify';
+    if (_showConfirm) return 'Confirm';
+    return 'Continue';
+  }
+
+  Future<void> _handleAction() async {
+    if (_isUnlock) {
+      await _verifyPin();
+    } else if (_isChange && _currentPin == null) {
+      await _verifyCurrentPinForChange();
+    } else if (_isSetup || (_isChange && _currentPin != null)) {
+      await _setupOrChangePin();
+    }
   }
 
   Widget _buildWipeContent(ColorScheme colors) {
@@ -442,7 +538,12 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
         if (mounted) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
-            Navigator.pushReplacementNamed(context, '/');
+            final cb = widget.onResult;
+            if (cb != null) {
+              cb(true);
+            } else {
+              Navigator.pushReplacementNamed(context, '/');
+            }
           });
         }
       } else {
@@ -466,7 +567,7 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
       });
       return;
     }
-    if (_pinController.text.length != 4) {
+    if (_pinController.text.length != 4 || !_allDigits(_pinController.text)) {
       setState(() { _error = true; _errorMsg = 'PIN must be 4 digits'; });
       _triggerShake();
       return;
@@ -478,10 +579,15 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
       if (!mounted) return;
       if (isValid) {
         await _tryStoreBiometricKey();
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!mounted) return;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          final cb = widget.onResult;
+          if (cb != null) {
+            cb(true);
+          } else {
             Navigator.pushReplacementNamed(context, '/');
-          });
+          }
+        });
       } else if (auth.vaultWiped) {
         setState(() {
           _vaultWiped = true;
@@ -510,16 +616,46 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _tryStoreBiometricKey() async {
+  Future<void> _verifyCurrentPinForChange() async {
+    if (_isProcessing) return;
     final auth = context.read<AuthService>();
-    if (!auth.biometricAvailable) return;
-    if (!await auth.getBiometricUserEnabled()) return;
-    await auth.storeBiometricKey();
+    if (_pinController.text.length != 4 || !_allDigits(_pinController.text)) {
+      setState(() { _error = true; _errorMsg = 'PIN must be 4 digits'; });
+      _triggerShake();
+      return;
+    }
+    _isProcessing = true;
+    setState(() { _loading = true; _loadingText = 'Verifying current PIN...'; });
+    try {
+      final isValid = await auth.verifyPin(_pinController.text);
+      if (!mounted) return;
+      if (isValid) {
+        setState(() {
+          _currentPin = _pinController.text;
+          _pinController.clear();
+          _error = false;
+          _loading = false;
+        });
+        _isProcessing = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _pinFocus.requestFocus();
+        });
+      } else {
+        _isProcessing = false;
+        setState(() { _error = true; _errorMsg = 'Incorrect PIN'; _loading = false; });
+        _triggerShake();
+      }
+    } catch (_) {
+      _isProcessing = false;
+      if (mounted) {
+        setState(() { _error = true; _errorMsg = 'Verification failed'; _loading = false; });
+      }
+    }
   }
 
-  Future<void> _setupPin() async {
+  Future<void> _setupOrChangePin() async {
     if (_isProcessing) return;
-    if (_pinController.text.length != 4) {
+    if (_pinController.text.length != 4 || !_allDigits(_pinController.text)) {
       setState(() { _error = true; _errorMsg = 'PIN must be 4 digits'; });
       _triggerShake();
       return;
@@ -536,29 +672,46 @@ class _PinScreenState extends State<PinScreen> with TickerProviderStateMixin {
       _triggerShake();
       return;
     }
-    setState(() { _loading = true; _loadingText = 'Securing vault...'; });
+    setState(() { _loading = true; _loadingText = _isChange ? 'Changing PIN...' : 'Securing vault...'; });
     _isProcessing = true;
     final auth = context.read<AuthService>();
     try {
-      final success = await auth.setupPin(_pinController.text);
-      if (!mounted) return;
-      if (success) {
+      if (_isChange) {
+        await auth.changePin(_currentPin!, _pinController.text);
+      } else {
+        final ok = await auth.setupPin(_pinController.text);
+        if (!mounted) return;
+        if (!ok) {
+          _isProcessing = false;
+          setState(() { _error = true; _errorMsg = 'Could not secure vault'; _loading = false; });
+          return;
+        }
         await auth.importPendingOnboardingPayday();
         await auth.importStartingBalance();
         await _tryStoreBiometricKey();
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!mounted) return;
-            Navigator.pushReplacementNamed(context, '/');
-          });
-      } else {
-        _isProcessing = false;
-        setState(() { _error = true; _errorMsg = 'Could not secure vault'; _loading = false; });
       }
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final cb = widget.onResult;
+        if (cb != null) {
+          cb(true);
+        } else {
+          Navigator.pushReplacementNamed(context, '/');
+        }
+      });
     } catch (_) {
       _isProcessing = false;
       if (mounted) {
-        setState(() { _error = true; _errorMsg = 'Vault setup failed'; _loading = false; });
+        setState(() { _error = true; _errorMsg = _isChange ? 'PIN change failed' : 'Vault setup failed'; _loading = false; });
       }
     }
+  }
+
+  Future<void> _tryStoreBiometricKey() async {
+    final auth = context.read<AuthService>();
+    if (!auth.biometricAvailable) return;
+    if (!await auth.getBiometricUserEnabled()) return;
+    await auth.storeBiometricKey();
   }
 }

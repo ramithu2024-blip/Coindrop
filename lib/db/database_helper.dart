@@ -60,12 +60,13 @@ class DatabaseHelper {
     _db = await DatabaseHelper.factory.openDatabase(
       path,
       options: OpenDatabaseOptions(
-        version: 4,
+        version: 5,
         onConfigure: (db) async {
           // SECURITY: PRAGMA key MUST execute in onConfigure, which runs
           // BEFORE onCreate/onUpgrade.  Some SQLCipher builds reject the
           // key if it comes after any schema interaction.
           await db.execute("PRAGMA key = '$hexKey'");
+          await db.execute('PRAGMA foreign_keys = ON');
         },
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
@@ -109,12 +110,13 @@ class DatabaseHelper {
     _db = await DatabaseHelper.factory.openDatabase(
       path,
       options: OpenDatabaseOptions(
-        version: 4,
+        version: 5,
         onConfigure: (db) async {
           // cipher_compatibility = 4 tells SQLCipher to use standard
           // SQLite format (no encryption). Must run BEFORE any schema
           // interaction, just like PRAGMA key.
           await db.execute("PRAGMA cipher_compatibility = 4");
+          await db.execute('PRAGMA foreign_keys = ON');
         },
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
@@ -141,17 +143,19 @@ class DatabaseHelper {
   /// then allocations). Updates sqlite_sequence so AUTOINCREMENT works correctly.
   Future<void> importAllData(Map<String, List<Map<String, dynamic>>> data) async {
     final db = _requireDb();
-    const tables = ['envelopes', 'paydays', 'recurring_paydays', 'transactions', 'allocations'];
-    for (final table in tables) {
-      final rows = data[table] ?? [];
-      for (final row in rows) {
-        await db.insert(table, row);
+    await db.transaction((txn) async {
+      const tables = ['envelopes', 'paydays', 'recurring_paydays', 'transactions', 'allocations'];
+      for (final table in tables) {
+        final rows = data[table] ?? [];
+        for (final row in rows) {
+          await txn.insert(table, row);
+        }
+        if (rows.isNotEmpty) {
+          final maxId = rows.map((r) => r['id'] as int).reduce((a, b) => a > b ? a : b);
+          await txn.execute('INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES (?, ?)', [table, maxId]);
+        }
       }
-      if (rows.isNotEmpty) {
-        final maxId = rows.map((r) => r['id'] as int).reduce((a, b) => a > b ? a : b);
-        await db.execute('INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES (?, ?)', [table, maxId]);
-      }
-    }
+    });
   }
 
   /// Deletes the database file (and WAL/SHM journals) from disk.
@@ -233,6 +237,12 @@ class DatabaseHelper {
         last_processed_date TEXT
       )
     ''');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_envelope_id ON transactions(envelope_id)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_allocations_payday_id ON allocations(payday_id)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_allocations_envelope_id ON allocations(envelope_id)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_paydays_date ON paydays(date)');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -290,6 +300,14 @@ class DatabaseHelper {
         )
       ''');
     }
+    if (oldVersion < 5) {
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_envelope_id ON transactions(envelope_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_allocations_payday_id ON allocations(payday_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_allocations_envelope_id ON allocations(envelope_id)');
+      await db.execute('CREATE INDEX IF NOT EXISTS idx_paydays_date ON paydays(date)');
+    }
   }
 
   Database _requireDb() {
@@ -301,7 +319,10 @@ class DatabaseHelper {
 
   Future<int> insertEnvelope(Envelope envelope) async {
     final db = _requireDb();
-    return await db.insert('envelopes', envelope.toMap()..remove('id'));
+    final map = envelope.toMap()..remove('id');
+    // initial_amount is legacy -- always write 0
+    map['initial_amount'] = 0;
+    return await db.insert('envelopes', map);
   }
 
   Future<List<Envelope>> getEnvelopes() async {
@@ -322,22 +343,28 @@ class DatabaseHelper {
 
   Future<void> deleteAllEnvelopes() async {
     final db = _requireDb();
-    await db.delete('allocations');
-    await db.delete('transactions');
-    await db.delete('envelopes');
+    await db.transaction((txn) async {
+      await txn.delete('allocations');
+      await txn.delete('transactions');
+      await txn.delete('envelopes');
+    });
   }
 
   Future<void> deleteAllPaydays() async {
     final db = _requireDb();
-    await db.delete('allocations');
-    await db.delete('paydays');
+    await db.transaction((txn) async {
+      await txn.delete('allocations');
+      await txn.delete('paydays');
+    });
   }
 
   Future<int> deleteEnvelope(int id) async {
     final db = _requireDb();
-    await db.delete('transactions', where: 'envelope_id = ?', whereArgs: [id]);
-    await db.delete('allocations', where: 'envelope_id = ?', whereArgs: [id]);
-    return await db.delete('envelopes', where: 'id = ?', whereArgs: [id]);
+    return await db.transaction((txn) async {
+      await txn.delete('transactions', where: 'envelope_id = ?', whereArgs: [id]);
+      await txn.delete('allocations', where: 'envelope_id = ?', whereArgs: [id]);
+      return await txn.delete('envelopes', where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   Future<int> insertTransaction(model.Transaction transaction) async {
@@ -442,8 +469,10 @@ class DatabaseHelper {
 
   Future<int> deletePayday(int paydayId) async {
     final db = _requireDb();
-    await db.delete('allocations', where: 'payday_id = ?', whereArgs: [paydayId]);
-    return await db.delete('paydays', where: 'id = ?', whereArgs: [paydayId]);
+    return await db.transaction((txn) async {
+      await txn.delete('allocations', where: 'payday_id = ?', whereArgs: [paydayId]);
+      return await txn.delete('paydays', where: 'id = ?', whereArgs: [paydayId]);
+    });
   }
 
   Future<int> insertAllocation(Allocation allocation) async {

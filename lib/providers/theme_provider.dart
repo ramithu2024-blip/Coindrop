@@ -26,7 +26,7 @@ enum ThemeModeOption {
   static ThemeModeOption fromStorage(String value) {
     return ThemeModeOption.values.firstWhere(
       (e) => e.name == value,
-      orElse: () => ThemeModeOption.timeBased,
+      orElse: () => ThemeModeOption.system,
     );
   }
 }
@@ -72,8 +72,8 @@ class AccentColorOption {
 }
 
 class ThemeProvider extends ChangeNotifier {
-  ThemeModeOption _themeModeOption = ThemeModeOption.timeBased;
-  int _accentColorValue = 0xFF00BCD4;
+  ThemeModeOption _themeModeOption = ThemeModeOption.system;
+  int _accentColorValue = 0xFF4CAF50;
   bool _cashIconAccent = true;
   bool _useCustomEnvelopeColors = true;
 
@@ -111,9 +111,9 @@ class ThemeProvider extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       _themeModeOption = ThemeModeOption.fromStorage(
-          prefs.getString('theme_mode') ?? 'timeBased');
+          prefs.getString('theme_mode') ?? 'system');
       _accentColorValue =
-          prefs.getInt('accent_color') ?? 0xFF00BCD4;
+          prefs.getInt('accent_color') ?? 0xFF4CAF50;
       _cashIconAccent = prefs.getBool('cash_icon_accent') ?? true;
       _useCustomEnvelopeColors = prefs.getBool('use_custom_env_colors') ?? true;
       notifyListeners();

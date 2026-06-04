@@ -5,6 +5,7 @@ import 'package:coindrop/app.dart';
 import 'package:coindrop/providers/theme_provider.dart';
 import 'package:coindrop/providers/app_lock_provider.dart';
 import 'package:coindrop/services/security/auth_service.dart';
+import 'package:coindrop/services/security/build_gate_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -13,9 +14,11 @@ void main() {
     final auth = AuthService();
     final theme = ThemeProvider();
     final appLock = AppLockProvider(auth);
+    final buildGate = BuildGateService();
     await tester.pumpWidget(
       MultiProvider(
         providers: [
+          ChangeNotifierProvider(create: (_) => buildGate),
           ChangeNotifierProvider(create: (_) => theme),
           ChangeNotifierProvider(create: (_) => auth),
           ChangeNotifierProvider(create: (_) => appLock),

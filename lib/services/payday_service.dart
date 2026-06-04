@@ -32,21 +32,21 @@ class PaydayService {
 
     final todayStr = DateFormat('yyyy-MM-dd').format(now);
     final lastStr = DateFormat('yyyy-MM-dd').format(lastDate);
+    final todayDate = DateTime(now.year, now.month, now.day);
 
     if (todayStr == lastStr) return false;
 
     if (rule.frequency == 'weekly') {
       if (rule.weekday == null) return false;
-      final todayWeekday = now.weekday;
-      if (todayWeekday != rule.weekday) return false;
-      return lastDate.isBefore(DateTime(now.year, now.month, now.day));
+      if (todayDate.weekday != rule.weekday) return false;
+      return lastDate.isBefore(todayDate.subtract(const Duration(days: 6)));
     } else if (rule.frequency == 'fortnightly') {
       if (rule.weekday == null) return false;
-      if (now.weekday != rule.weekday) return false;
-      return lastDate.isBefore(now.subtract(const Duration(days: 13)));
+      if (todayDate.weekday != rule.weekday) return false;
+      return lastDate.isBefore(todayDate.subtract(const Duration(days: 13)));
     } else if (rule.frequency == 'monthly') {
       if (rule.monthDay == null) return false;
-      if (now.day != rule.monthDay) return false;
+      if (todayDate.day != rule.monthDay) return false;
       return lastDate.year < now.year ||
           (lastDate.year == now.year && lastDate.month < now.month);
     }

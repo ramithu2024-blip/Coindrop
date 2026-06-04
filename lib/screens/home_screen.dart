@@ -13,6 +13,7 @@ import '../widgets/transaction_tile.dart';
 import '../screens/insights_screen.dart';
 import '../screens/payday_history_screen.dart';
 import '../utils/currency.dart';
+import '../l10n/app_strings.dart';
 import '../theme/app_theme.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -57,6 +58,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _initialized = true);
     try {
       final provider = context.read<EnvelopeProvider>();
+      await provider.loadEnvelopes();
       await provider.processRecurringPaydays();
 
       final rules = await provider.getRecurringPaydays();
@@ -138,7 +140,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Paycheck of ${formatCurrency(amount)} confirmed'),
+          content: Text('${AppStrings.dashboardPaycheckConfirmed} — ${formatCurrency(amount)}'),
           backgroundColor: Theme.of(context).colorScheme.primary.withAlpha(200),
           behavior: SnackBarBehavior.floating,
         ),
@@ -150,7 +152,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _paydaySkipped = true);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: const Text('You can confirm your payday later from the Paydays tab'),
+        content: const Text(AppStrings.dashboardPaycheckLater),
         backgroundColor: Theme.of(context).colorScheme.primary.withAlpha(200),
         behavior: SnackBarBehavior.floating,
       ),
@@ -161,7 +163,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
 
-    return Scaffold(
+    final widget = Scaffold(
       backgroundColor: colors.surface,
       appBar: AppBar(
         title: Text(
@@ -223,6 +225,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             )
           : null,
     );
+
+    return widget;
   }
 
   Widget _buildBottomNav(ColorScheme colors) {
@@ -419,12 +423,12 @@ class _DashboardTab extends StatelessWidget {
               size: 64, color: colors.onSurface.withAlpha(50)),
           const SizedBox(height: 16),
           Text(
-            'No envelopes yet',
+            AppStrings.dashboardEmptyTitle,
             style: AppTextStyles.emptyTitle(context),
           ),
           const SizedBox(height: 8),
           Text(
-            'Tap + to create your first envelope\nThen use the \$ button for a payday',
+            AppStrings.dashboardEmptyBody,
             style: AppTextStyles.emptyBody(context),
             textAlign: TextAlign.center,
           ),
@@ -482,7 +486,7 @@ class _PaydayReminderCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Did you receive your payday today?',
+                      Text(AppStrings.paydayReminderTitle,
                         style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: colors.onSurface)),
                       const SizedBox(height: 2),
                       Text(
@@ -501,7 +505,7 @@ class _PaydayReminderCard extends StatelessWidget {
                   child: OutlinedButton.icon(
                     onPressed: onSkipped,
                     icon: const Icon(Icons.schedule, size: 16),
-                    label: const Text('Not yet', style: TextStyle(fontSize: 13)),
+                    label: const Text(AppStrings.paydayReminderNotYet, style: TextStyle(fontSize: 13)),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: colors.onSurface.withAlpha(150),
                       side: BorderSide(color: colors.onSurface.withAlpha(40)),
@@ -515,7 +519,7 @@ class _PaydayReminderCard extends StatelessWidget {
                   child: FilledButton.icon(
                     onPressed: onReceived,
                     icon: const Icon(Icons.check, size: 16),
-                    label: const Text('Yes, allocate now', style: TextStyle(fontSize: 13)),
+                    label: const Text(AppStrings.paydayReminderYes, style: TextStyle(fontSize: 13)),
                     style: FilledButton.styleFrom(
                       backgroundColor: colors.primary,
                       foregroundColor: colors.onPrimary,
@@ -566,10 +570,10 @@ class _MissedPaydayCard extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Missed payday reminder',
+                  Text(AppStrings.paydayMissedTitle,
                     style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.orange.shade800)),
                   const SizedBox(height: 2),
-                  Text('${formatCurrency(amount)}${note.isNotEmpty ? ' - $note' : ''} was due yesterday',
+                  Text('${formatCurrency(amount)}${note.isNotEmpty ? ' - $note' : ''} ${AppStrings.paydayMissedSubtitle}',
                     style: TextStyle(fontSize: 11, color: Colors.orange.shade700)),
                 ],
               ),
@@ -580,7 +584,7 @@ class _MissedPaydayCard extends StatelessWidget {
                 foregroundColor: colors.primary,
                 padding: const EdgeInsets.symmetric(horizontal: 10),
               ),
-              child: const Text('Confirm', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+              child: Text(AppStrings.paydayMissedCta, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
             ),
           ],
         ),
@@ -635,7 +639,7 @@ class _MoneyRealityCheck extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text('Money Reality Check',
+                Text(AppStrings.dashboardRealityCheck,
                   style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: colors.onSurface.withAlpha(180))),
                 if (daysUntilPayday <= 30)
                   Container(
@@ -645,7 +649,7 @@ class _MoneyRealityCheck extends StatelessWidget {
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
-                      '$daysUntilPayday days until payday',
+                      '$daysUntilPayday ${AppStrings.dashboardDaysUntilPayday}',
                       style: TextStyle(
                         fontSize: 10, fontWeight: FontWeight.w600,
                         color: daysUntilPayday <= 3 ? Colors.orange : colors.primary,
@@ -658,17 +662,17 @@ class _MoneyRealityCheck extends StatelessWidget {
             Row(
               children: [
                 Expanded(
-                  child: _statBlock(context, 'Available', formatCurrency(totalAvailable),
+                  child: _statBlock(context, AppStrings.dashboardAvailable, formatCurrency(totalAvailable),
                       totalAvailable < 0 ? Colors.redAccent : colors.primary, colors),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: _statBlock(context, 'Allocated', formatCurrency(totalAllocated),
+                  child: _statBlock(context, AppStrings.dashboardAllocated, formatCurrency(totalAllocated),
                       Colors.amberAccent, colors),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: _statBlock(context, 'Unassigned', formatCurrency(unallocated),
+                  child: _statBlock(context, AppStrings.dashboardUnassigned, formatCurrency(unallocated),
                       unallocated > 0 ? Colors.greenAccent : colors.onSurface.withAlpha(100), colors),
                 ),
               ],
@@ -677,17 +681,17 @@ class _MoneyRealityCheck extends StatelessWidget {
             Row(
               children: [
                 Expanded(
-                  child: _statBlock(context, 'Spent/Month', formatCurrency(monthlySpent),
+                  child: _statBlock(context, AppStrings.dashboardSpentMonth, formatCurrency(monthlySpent),
                       Colors.redAccent, colors),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: _statBlock(context, 'Envelopes', '${provider.envelopes.length}',
+                  child: _statBlock(context, AppStrings.dashboardEnvelopes, '${provider.envelopes.length}',
                       colors.primary, colors),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: _statBlock(context, 'Last Pay', lastPayLabel,
+                  child: _statBlock(context, AppStrings.dashboardLastPay, lastPayLabel,
                       colors.primary, colors),
                 ),
               ],
@@ -707,8 +711,8 @@ class _MoneyRealityCheck extends StatelessWidget {
                     Expanded(
                       child: Text(
                         spendingFast
-                            ? 'Spending is trending ${trendPercent.toStringAsFixed(0)}% faster than last month'
-                            : 'You\'ve spent more than available',
+                            ? '${AppStrings.dashboardSpendingFaster.replaceAll('%', trendPercent.toStringAsFixed(0))}'
+                            : AppStrings.dashboardOverSpent,
                         style: TextStyle(fontSize: 11, color: Colors.redAccent),
                       ),
                     ),

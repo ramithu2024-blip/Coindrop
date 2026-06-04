@@ -169,13 +169,13 @@ class EnvelopeProvider extends ChangeNotifier {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
     if (rule.frequency == 'weekly') {
-      final target = rule.weekday ?? DateTime.monday;
-      var diff = target - today.weekday;
+      if (rule.weekday == null) return 999;
+      var diff = rule.weekday! - today.weekday;
       if (diff <= 0) diff += 7;
       return diff;
     } else if (rule.frequency == 'fortnightly') {
-      final target = rule.weekday ?? DateTime.monday;
-      var diff = target - today.weekday;
+      if (rule.weekday == null) return 999;
+      var diff = rule.weekday! - today.weekday;
       if (diff <= 0) diff += 14;
       return diff;
     } else if (rule.frequency == 'monthly') {
